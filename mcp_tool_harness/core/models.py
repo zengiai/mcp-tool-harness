@@ -522,6 +522,73 @@ class ToolCallRecord(JsonModelMixin):
 
 
 @dataclass(slots=True)
+class AgentRunRecord(JsonModelMixin):
+    run_id: str
+    request_id: str
+    trace_id: str
+    agent_id: str
+    provider: str = ""
+    model: str = ""
+    prompt_hash: str = ""
+    status: str = "succeeded"
+    final_answer: str = ""
+    tool_call_count: int = 0
+    error: str | None = None
+    started_at: datetime = field(default_factory=utc_now)
+    finished_at: datetime | None = None
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        _require_text(self.run_id, "run_id")
+        _require_text(self.request_id, "request_id")
+        _require_text(self.trace_id, "trace_id")
+        _require_text(self.agent_id, "agent_id")
+        if self.tool_call_count < 0:
+            raise ValueError("tool_call_count must be zero or positive")
+        if self.finished_at is not None and self.finished_at < self.started_at:
+            raise ValueError("finished_at must be greater than or equal to started_at")
+
+
+@dataclass(slots=True)
+class AgentToolCallRecord(JsonModelMixin):
+    run_id: str
+    request_id: str
+    trace_id: str
+    tool_call_id: str
+    round_index: int
+    step_index: int
+    model_tool_name: str
+    tool_name: str
+    arguments: Mapping[str, Any] = field(default_factory=dict)
+    status: ToolCallStatus = ToolCallStatus.SUCCEEDED
+    result: Any = None
+    error: str | None = None
+    error_type: str | None = None
+    error_code: str | None = None
+    cached: bool = False
+    server_id: str | None = None
+    tool_version: str | None = None
+    started_at: datetime = field(default_factory=utc_now)
+    finished_at: datetime = field(default_factory=utc_now)
+    metadata: dict[str, Any] = field(default_factory=dict)
+    record_id: str = field(default_factory=lambda: f"agent_tool_call_{uuid.uuid4().hex}")
+
+    def __post_init__(self) -> None:
+        _require_text(self.run_id, "run_id")
+        _require_text(self.request_id, "request_id")
+        _require_text(self.trace_id, "trace_id")
+        _require_text(self.tool_call_id, "tool_call_id")
+        _require_text(self.model_tool_name, "model_tool_name")
+        _require_text(self.tool_name, "tool_name")
+        if self.round_index < 1:
+            raise ValueError("round_index must be positive")
+        if self.step_index < 1:
+            raise ValueError("step_index must be positive")
+        if self.finished_at < self.started_at:
+            raise ValueError("finished_at must be greater than or equal to started_at")
+
+
+@dataclass(slots=True)
 class ApprovalTask(JsonModelMixin):
     context: ToolCallContext
     reason: str

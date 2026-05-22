@@ -8,13 +8,19 @@ from __future__ import annotations
 
 import asyncio
 from copy import deepcopy
-from typing import TypeVar
+from typing import Any, Mapping, TypeVar
 
 from mcp_tool_harness.core.models import (
+    AgentRunRecord,
+    AgentToolCallRecord,
     ApprovalStatus,
     ApprovalTask,
+    DecisionEffect,
+    PolicyDecision,
     ToolCallRecord,
+    ToolCallStatus,
     ToolPolicy,
+    ToolResult,
     ToolServer,
     ToolSpec,
 )
@@ -165,6 +171,42 @@ class InMemoryAuditRepository:
             self._items[stored.record_id] = stored
             return _clone(stored)
 
+    async def record_call(
+        self,
+        *,
+        context: Any,
+        tool: Any,
+        args: Mapping[str, Any] | None = None,
+        status: ToolCallStatus | str | None = None,
+        error_code: str | None = None,
+        latency_ms: int | None = None,
+        result: ToolResult | None = None,
+        decision: PolicyDecision | None = None,
+    ) -> ToolCallRecord:
+        call_status = _coerce_tool_call_status(status, result)
+        policy_decision = decision or _decision_from_status(call_status, error_code)
+        metadata: dict[str, Any] = {
+            "arguments": dict(args or {}),
+        }
+        if latency_ms is not None:
+            metadata["latency_ms"] = latency_ms
+        if error_code is not None:
+            metadata["error_code"] = error_code
+        context_metadata = getattr(context, "metadata", None)
+        if isinstance(context_metadata, Mapping):
+            metadata.update({str(key): value for key, value in context_metadata.items()})
+
+        record = ToolCallRecord(
+            context=context,
+            decision=policy_decision,
+            result=result,
+            tool_id=getattr(tool, "tool_id", None),
+            server_id=getattr(tool, "server_id", getattr(context, "server_id", None)),
+            status=call_status,
+            metadata=metadata,
+        )
+        return await self.append(record)
+
     async def get(self, record_id: str) -> ToolCallRecord | None:
         async with self._lock:
             item = self._items.get(record_id)
@@ -192,6 +234,80 @@ class InMemoryAuditRepository:
                     item for item in records if item.context.principal == principal
                 ]
             return [_clone(item) for item in records[-limit:]]
+
+
+class InMemoryAgentRunRepository:
+    def __init__(self) -> None:
+        self._runs: dict[str, AgentRunRecord] = {}
+        self._run_order: list[str] = []
+        self._tool_calls: dict[str, AgentToolCallRecord] = {}
+        self._tool_call_order: list[str] = []
+        self._lock = asyncio.Lock()
+
+    async def save_run(self, record: AgentRunRecord) -> AgentRunRecord:
+        async with self._lock:
+            stored = _clone(record)
+            if stored.run_id not in self._runs:
+                self._run_order.append(stored.run_id)
+            self._runs[stored.run_id] = stored
+            return _clone(stored)
+
+    async def append_tool_call(self, record: AgentToolCallRecord) -> AgentToolCallRecord:
+        async with self._lock:
+            stored = _clone(record)
+            if stored.record_id not in self._tool_calls:
+                self._tool_call_order.append(stored.record_id)
+            self._tool_calls[stored.record_id] = stored
+            return _clone(stored)
+
+    async def get_run(self, run_id: str) -> AgentRunRecord | None:
+        async with self._lock:
+            item = self._runs.get(run_id)
+            return _clone(item) if item is not None else None
+
+    async def list_runs(
+        self,
+        *,
+        request_id: str | None = None,
+        agent_id: str | None = None,
+        status: str | None = None,
+        limit: int = 100,
+    ) -> list[AgentRunRecord]:
+        if limit <= 0:
+            raise ValueError("limit must be positive")
+        async with self._lock:
+            runs = [self._runs[item_id] for item_id in self._run_order]
+            if request_id is not None:
+                runs = [item for item in runs if item.request_id == request_id]
+            if agent_id is not None:
+                runs = [item for item in runs if item.agent_id == agent_id]
+            if status is not None:
+                runs = [item for item in runs if item.status == status]
+            return [_clone(item) for item in runs[-limit:]]
+
+    async def list_tool_calls(
+        self,
+        *,
+        run_id: str | None = None,
+        request_id: str | None = None,
+        tool_name: str | None = None,
+        status: ToolCallStatus | str | None = None,
+        limit: int = 100,
+    ) -> list[AgentToolCallRecord]:
+        if limit <= 0:
+            raise ValueError("limit must be positive")
+        call_status = None if status is None else ToolCallStatus(status)
+        async with self._lock:
+            calls = [self._tool_calls[item_id] for item_id in self._tool_call_order]
+            if run_id is not None:
+                calls = [item for item in calls if item.run_id == run_id]
+            if request_id is not None:
+                calls = [item for item in calls if item.request_id == request_id]
+            if tool_name is not None:
+                calls = [item for item in calls if item.tool_name == tool_name]
+            if call_status is not None:
+                calls = [item for item in calls if item.status == call_status]
+            return [_clone(item) for item in calls[-limit:]]
 
 
 class InMemoryApprovalRepository:
@@ -228,3 +344,36 @@ class InMemoryApprovalRepository:
             if requested_by is not None:
                 tasks = [item for item in tasks if item.requested_by == requested_by]
             return [_clone(item) for item in tasks[-limit:]]
+
+
+def _coerce_tool_call_status(
+    status: ToolCallStatus | str | None,
+    result: ToolResult | None,
+) -> ToolCallStatus:
+    if status is not None:
+        return status if isinstance(status, ToolCallStatus) else ToolCallStatus(str(status))
+    if result is not None:
+        return result.status
+    return ToolCallStatus.SUCCEEDED
+
+
+def _decision_from_status(status: ToolCallStatus, error_code: str | None) -> PolicyDecision:
+    if status is ToolCallStatus.RATE_LIMITED:
+        return PolicyDecision(
+            effect=DecisionEffect.DENY,
+            reason="rate limited",
+            rate_limited=True,
+            metadata={"reason_code": error_code or "RATE_LIMITED"},
+        )
+    if status is ToolCallStatus.CIRCUIT_OPEN:
+        return PolicyDecision(
+            effect=DecisionEffect.DENY,
+            reason="circuit open",
+            circuit_open=True,
+            metadata={"reason_code": error_code or "CIRCUIT_OPEN"},
+        )
+    if status is ToolCallStatus.DENIED:
+        return PolicyDecision.denied(error_code or "tool invocation denied")
+    if status is ToolCallStatus.PENDING_APPROVAL:
+        return PolicyDecision.require_approval(error_code or "approval required")
+    return PolicyDecision.allowed("tool invocation recorded")

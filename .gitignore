@@ -8,6 +8,8 @@ htmlcov/
 
 .idea/
 .vscode/
+.agent/
+docs/
 
 build/
 dist/

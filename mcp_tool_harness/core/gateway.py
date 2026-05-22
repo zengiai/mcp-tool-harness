@@ -88,6 +88,8 @@ class ToolGateway:
         timeout_ms = await self._resolve_timeout_ms(tool, context)
         idempotency_key = context.idempotency_key
         idempotency_started = False
+        audit_result: ToolResult | None = None
+        audit_decision = PolicyDecision.allowed("policy not evaluated")
 
         try:
             # 主链路第一步只做本地 schema 校验，失败时不触发 MCP/RPC 下游，避免无效流量打到业务系统。
@@ -99,25 +101,34 @@ class ToolGateway:
                 if not allowed:
                     status = ToolCallStatus.RATE_LIMITED
                     error_code = "RATE_LIMITED"
-                    return ToolResult.failed(
+                    audit_decision = PolicyDecision(
+                        effect=DecisionEffect.DENY,
+                        reason="rate limited",
+                        rate_limited=True,
+                        metadata={"reason_code": error_code},
+                    )
+                    audit_result = ToolResult.failed(
                         call_id=context.call_id,
                         trace_id=context.trace_id,
                         error_code=error_code,
                         error_message="tool invocation rate limited",
                         status=status,
                     )
+                    return audit_result
 
             # 权限和风险判断必须在执行前完成；模型或框架传来的调用意图不能被默认信任。
             decision = await self._check_permission(context, tool, normalized_args)
+            audit_decision = decision
             if decision.effect is DecisionEffect.DENY:
                 status = ToolCallStatus.DENIED
                 error_code = decision.reason_code or "PERMISSION_DENIED"
-                return ToolResult.rejected(
+                audit_result = ToolResult.rejected(
                     call_id=context.call_id,
                     trace_id=context.trace_id,
                     error_code=error_code,
                     error_message=decision.reason or "tool invocation denied",
                 )
+                return audit_result
 
             # 高风险工具默认走人工审批；没有审批中心时按失败处理，避免误放行写操作。
             if decision.effect is DecisionEffect.REQUIRE_APPROVAL:
@@ -125,17 +136,21 @@ class ToolGateway:
                 if not approved:
                     status = ToolCallStatus.DENIED
                     error_code = "APPROVAL_REJECTED"
-                    return ToolResult.rejected(
+                    audit_result = ToolResult.rejected(
                         call_id=context.call_id,
                         trace_id=context.trace_id,
                         error_code=error_code,
                         error_message="tool invocation rejected by approval center",
                     )
+                    return audit_result
 
             # 幂等记录只包住真正的执行阶段，确保重试不会重复触发写操作类工具。
             if idempotency_key and self.idempotency_store is not None:
                 cached = await self._get_cached_idempotent_result(idempotency_key)
                 if cached is not None:
+                    audit_result = cached
+                    status = cached.status
+                    error_code = cached.error_code
                     return cached
                 idempotency_started = await self._start_idempotency(
                     idempotency_key,
@@ -146,6 +161,9 @@ class ToolGateway:
 
             # 真实调用统一收敛到 MCP client；RPC 工具也应先包装成 MCP/Harness tool 再进入这里。
             result = await self._execute_with_protection(tool, normalized_args, context, timeout_ms)
+            audit_result = result
+            status = result.status
+            error_code = result.error_code
             if idempotency_key and self.idempotency_store is not None and result.success:
                 await self._store_idempotent_success(idempotency_key, result, idempotency_started)
             return result
@@ -154,28 +172,50 @@ class ToolGateway:
             error_code = "TOOL_TIMEOUT"
             if idempotency_key and idempotency_started:
                 await self._store_idempotent_failure(idempotency_key, exc)
-            return ToolResult.failed(
+            audit_result = ToolResult.failed(
                 call_id=context.call_id,
                 trace_id=context.trace_id,
                 error_code=error_code,
                 error_message=str(exc) or "tool invocation timed out",
             )
+            return audit_result
         except Exception as exc:  # noqa: BLE001 - gateway must normalize downstream failures.
-            status = ToolCallStatus.FAILED
-            error_code = exc.__class__.__name__
+            if exc.__class__.__name__ == "CircuitBreakerOpenError":
+                status = ToolCallStatus.CIRCUIT_OPEN
+                error_code = "CIRCUIT_OPEN"
+                audit_decision = PolicyDecision(
+                    effect=DecisionEffect.DENY,
+                    reason="circuit open",
+                    circuit_open=True,
+                    metadata={"reason_code": error_code},
+                )
+            else:
+                status = ToolCallStatus.FAILED
+                error_code = exc.__class__.__name__
             if idempotency_key and idempotency_started:
                 await self._store_idempotent_failure(idempotency_key, exc)
-            return ToolResult.failed(
+            audit_result = ToolResult.failed(
                 call_id=context.call_id,
                 trace_id=context.trace_id,
                 error_code=error_code,
                 error_message=str(exc),
+                status=status,
             )
+            return audit_result
         finally:
             # 指标和审计不能影响主调用结果；内部会吞掉埋点异常，保障工具调用路径稳定。
             latency_ms = int((asyncio.get_running_loop().time() - started) * 1000)
             await self._record_metrics(resolved_tool_name, status, latency_ms)
-            await self._write_audit(context, tool, normalized_args, status, error_code, latency_ms)
+            await self._write_audit(
+                context,
+                tool,
+                normalized_args,
+                status,
+                error_code,
+                latency_ms,
+                result=audit_result,
+                decision=audit_decision,
+            )
 
     async def _get_tool(self, tool_name: str, version: str | None) -> Any:
         # 优先按 server/name/version 查，支持多 MCP Server 下相同 tool_name 的隔离。
@@ -384,26 +424,37 @@ class ToolGateway:
         status: ToolCallStatus,
         error_code: str | None,
         latency_ms: int,
+        *,
+        result: ToolResult | None = None,
+        decision: PolicyDecision | None = None,
     ) -> None:
         if self.audit is None:
             return
         try:
             writer = getattr(self.audit, "record_call", None)
             if writer is not None:
-                await self._maybe_await(
-                    writer(
-                        context=context,
-                        tool=tool,
-                        args=args,
-                        status=status,
-                        error_code=error_code,
-                        latency_ms=latency_ms,
-                    )
-                )
+                kwargs = {
+                    "context": context,
+                    "tool": tool,
+                    "args": args,
+                    "status": status,
+                    "error_code": error_code,
+                    "latency_ms": latency_ms,
+                    "result": result,
+                    "decision": decision,
+                }
+                await self._maybe_await(writer(**self._supported_kwargs(writer, kwargs)))
                 return
 
             logger = getattr(self.audit, "log", None)
             if logger is not None:
+                metadata = {
+                    "arguments": dict(args),
+                    "status": status.value,
+                    "error_code": error_code,
+                    "latency_ms": latency_ms,
+                }
+                metadata.update(context.metadata)
                 await self._maybe_await(
                     logger(
                         "tool_call",
@@ -413,12 +464,7 @@ class ToolGateway:
                         outcome="success" if status is ToolCallStatus.SUCCEEDED else "failure",
                         correlation_id=context.trace_id,
                         request_id=context.request_id,
-                        metadata={
-                            "arguments": dict(args),
-                            "status": status.value,
-                            "error_code": error_code,
-                            "latency_ms": latency_ms,
-                        },
+                        metadata=metadata,
                     )
                 )
         except Exception:
@@ -579,3 +625,13 @@ class ToolGateway:
         if inspect.isawaitable(value):
             return await value
         return value
+
+    @staticmethod
+    def _supported_kwargs(callable_obj: Callable[..., Any], kwargs: Mapping[str, Any]) -> dict[str, Any]:
+        try:
+            parameters = inspect.signature(callable_obj).parameters
+        except (TypeError, ValueError):
+            return dict(kwargs)
+        if any(parameter.kind is inspect.Parameter.VAR_KEYWORD for parameter in parameters.values()):
+            return dict(kwargs)
+        return {key: value for key, value in kwargs.items() if key in parameters}

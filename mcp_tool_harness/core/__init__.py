@@ -1,6 +1,8 @@
 """Core domain models and registry."""
 
 from mcp_tool_harness.core.models import (
+    AgentRunRecord,
+    AgentToolCallRecord,
     ApprovalStatus,
     ApprovalTask,
     AuthType,
@@ -29,6 +31,8 @@ from mcp_tool_harness.core.registry import (
 from mcp_tool_harness.core.security import PolicyAwareSecurity
 
 __all__ = [
+    "AgentRunRecord",
+    "AgentToolCallRecord",
     "ApprovalStatus",
     "ApprovalTask",
     "AuthType",

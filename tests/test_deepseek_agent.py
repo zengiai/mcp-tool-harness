@@ -6,7 +6,11 @@ from typing import Any, Mapping, Sequence
 import pytest
 
 from mcp_tool_harness.agent.deepseek import DeepSeekConfig, DeepSeekToolAgent
+from mcp_tool_harness.core import Registry, ToolCallStatus, ToolSpec
+from mcp_tool_harness.core.gateway import ToolGateway as CoreToolGateway
+from mcp_tool_harness.mcp import InMemoryTransport, MCPClient
 from mcp_tool_harness.server import ToolGateway
+from mcp_tool_harness.storage import InMemoryAgentRunRepository, InMemoryAuditRepository
 
 
 class FakeDeepSeekClient:
@@ -128,6 +132,81 @@ async def test_deepseek_agent_sends_tool_errors_back_to_model() -> None:
     assert payload["ok"] is False
     assert payload["error_type"] == "ToolInputValidationError"
     assert payload["error_code"] == "tool_input_validation_error"
+
+
+@pytest.mark.asyncio
+async def test_deepseek_agent_uses_core_gateway_and_records_agent_run() -> None:
+    registry = Registry()
+    await registry.register_tool(
+        ToolSpec(
+            name="math.add",
+            description="Add two integers.",
+            input_schema={
+                "type": "object",
+                "properties": {
+                    "left": {"type": "integer"},
+                    "right": {"type": "integer"},
+                },
+                "required": ["left", "right"],
+            },
+        )
+    )
+    transport = InMemoryTransport()
+    transport.add_tool("math.add", lambda args: {"value": args["left"] + args["right"]})
+    audit = InMemoryAuditRepository()
+    gateway = CoreToolGateway(
+        registry=registry,
+        security=None,
+        mcp_client=MCPClient.with_mock(transport),
+        audit=audit,
+    )
+    run_repository = InMemoryAgentRunRepository()
+    client = FakeDeepSeekClient(
+        [
+            {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [
+                    {
+                        "id": "tool-call-1",
+                        "type": "function",
+                        "function": {
+                            "name": "math_add",
+                            "arguments": '{"left": 2, "right": 3}',
+                        },
+                    }
+                ],
+            },
+            {"role": "assistant", "content": "2 + 3 = 5"},
+        ]
+    )
+    agent = DeepSeekToolAgent(gateway, client, principal="agent-a", run_repository=run_repository)
+
+    result = await agent.arun("计算 2 + 3", request_id="answer-1")
+
+    assert result.content == "2 + 3 = 5"
+    assert result.run_record is not None
+    assert result.run_record.request_id == "answer-1"
+    assert result.run_record.trace_id.startswith("trace_")
+    assert result.run_record.tool_call_count == 1
+    assert result.tool_call_records[0].run_id == result.run_record.run_id
+    assert result.tool_call_records[0].tool_call_id == "tool-call-1"
+    assert result.tool_call_records[0].round_index == 1
+    assert result.tool_call_records[0].step_index == 1
+    assert result.tool_call_records[0].trace_id == result.run_record.trace_id
+    assert result.tool_call_records[0].status is ToolCallStatus.SUCCEEDED
+    assert result.tool_invocations[0].run_id == result.run_record.run_id
+    assert result.tool_invocations[0].request_id == "answer-1:tool-call-1"
+
+    stored_runs = await run_repository.list_runs(request_id="answer-1")
+    stored_tool_calls = await run_repository.list_tool_calls(run_id=result.run_record.run_id)
+    audit_records = await audit.list_records(request_id="answer-1:tool-call-1")
+
+    assert stored_runs[0].run_id == result.run_record.run_id
+    assert stored_tool_calls[0].tool_call_id == "tool-call-1"
+    assert audit_records[0].metadata["run_id"] == result.run_record.run_id
+    assert audit_records[0].metadata["tool_call_id"] == "tool-call-1"
+    assert audit_records[0].context.trace_id == result.run_record.trace_id
 
 
 def test_deepseek_config_accepts_base_or_full_completion_url() -> None:

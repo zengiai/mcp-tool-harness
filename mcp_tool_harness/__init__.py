@@ -1,6 +1,8 @@
 """MCP Tool Harness public package exports."""
 
 from mcp_tool_harness.core.models import (
+    AgentRunRecord,
+    AgentToolCallRecord,
     ApprovalStatus,
     ApprovalTask,
     AuthType,
@@ -37,6 +39,8 @@ from mcp_tool_harness.config import (
 )
 
 __all__ = [
+    "AgentRunRecord",
+    "AgentToolCallRecord",
     "ApprovalStatus",
     "ApprovalTask",
     "AuthType",

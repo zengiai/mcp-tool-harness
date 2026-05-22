@@ -19,7 +19,17 @@ from hashlib import sha256
 from typing import Any, Mapping, Sequence
 from uuid import uuid4
 
-from mcp_tool_harness.server import ToolGateway, ToolHarnessError
+from mcp_tool_harness.core.models import (
+    AgentRunRecord,
+    AgentToolCallRecord,
+    ToolCallContext,
+    ToolCallStatus,
+    ToolResult,
+    stable_json_hash,
+    utc_now,
+)
+from mcp_tool_harness.server import ToolGateway as SimpleToolGateway
+from mcp_tool_harness.server import ToolHarnessError
 
 
 DEFAULT_DEEPSEEK_BASE_URL = "https://api.deepseek.com"
@@ -169,7 +179,12 @@ class DeepSeekChatClient:
 class ToolInvocation:
     """One tool call made by the model and executed through ToolGateway."""
 
+    run_id: str
+    request_id: str
+    trace_id: str
     tool_call_id: str
+    round_index: int
+    step_index: int
     model_tool_name: str
     tool_name: str
     arguments: Mapping[str, Any]
@@ -177,10 +192,17 @@ class ToolInvocation:
     result: Any = None
     error: str | None = None
     error_type: str | None = None
+    error_code: str | None = None
+    cached: bool = False
 
     def to_dict(self) -> dict[str, Any]:
         return {
+            "run_id": self.run_id,
+            "request_id": self.request_id,
+            "trace_id": self.trace_id,
             "tool_call_id": self.tool_call_id,
+            "round_index": self.round_index,
+            "step_index": self.step_index,
             "model_tool_name": self.model_tool_name,
             "tool_name": self.tool_name,
             "arguments": dict(self.arguments),
@@ -188,6 +210,8 @@ class ToolInvocation:
             "result": self.result,
             "error": self.error,
             "error_type": self.error_type,
+            "error_code": self.error_code,
+            "cached": self.cached,
         }
 
 
@@ -198,7 +222,20 @@ class AgentResult:
     content: str
     messages: Sequence[Mapping[str, Any]]
     tool_invocations: Sequence[ToolInvocation] = field(default_factory=tuple)
+    run_record: AgentRunRecord | None = None
+    tool_call_records: Sequence[AgentToolCallRecord] = field(default_factory=tuple)
     raw_message: Mapping[str, Any] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class _GatewayInvocation:
+    ok: bool
+    result: Any = None
+    cached: bool = False
+    status: ToolCallStatus = ToolCallStatus.SUCCEEDED
+    error: str | None = None
+    error_type: str | None = None
+    error_code: str | None = None
 
 
 class DeepSeekToolAgent:
@@ -215,18 +252,20 @@ class DeepSeekToolAgent:
 
     def __init__(
         self,
-        gateway: ToolGateway,
+        gateway: Any,
         client: Any,
         *,
         system_prompt: str = DEFAULT_SYSTEM_PROMPT,
         principal: str = "deepseek-agent",
         max_tool_rounds: int | None = None,
+        run_repository: Any | None = None,
     ) -> None:
         self.gateway = gateway
         self.client = client
         self.system_prompt = system_prompt
         self.principal = principal
         self.max_tool_rounds = max_tool_rounds
+        self.run_repository = run_repository
 
     def run(
         self,
@@ -260,54 +299,174 @@ class DeepSeekToolAgent:
             raise ValueError("prompt must be a non-empty string")
 
         call_request_id = request_id or f"agent-{uuid4().hex}"
+        run_id = f"agent_run_{uuid4().hex}"
+        trace_id = f"trace_{uuid4().hex}"
+        run_started = utc_now()
         caller = principal or self.principal
-        tools, alias_to_tool = _gateway_tools_for_model(self.gateway)
+        invocations: list[ToolInvocation] = []
+        tool_call_records: list[AgentToolCallRecord] = []
+        step_index = 0
+        max_tool_rounds = self._resolve_max_tool_rounds()
         messages: list[dict[str, Any]] = [{"role": "system", "content": self.system_prompt}]
         messages.extend(dict(item) for item in history or ())
         messages.append({"role": "user", "content": prompt})
-        invocations: list[ToolInvocation] = []
 
-        for _round_index in range(self._resolve_max_tool_rounds()):
-            assistant_message = dict(
-                await self.client.complete(
-                    messages,
-                    tools=tools,
-                    extra_body=extra_body,
+        try:
+            tools, alias_to_tool = await _gateway_tools_for_model(self.gateway)
+
+            for round_index in range(1, max_tool_rounds + 1):
+                assistant_message = dict(
+                    await self.client.complete(
+                        messages,
+                        tools=tools,
+                        extra_body=extra_body,
+                    )
                 )
+                tool_calls = _extract_tool_calls(assistant_message)
+                messages.append(_assistant_history_message(assistant_message))
+                if not tool_calls:
+                    content = str(assistant_message.get("content") or "")
+                    run_record = self._build_run_record(
+                        run_id=run_id,
+                        request_id=call_request_id,
+                        trace_id=trace_id,
+                        principal=caller,
+                        prompt=prompt,
+                        status="succeeded",
+                        final_answer=content,
+                        started_at=run_started,
+                        tool_call_count=len(tool_call_records),
+                    )
+                    await self._record_agent_run(run_record)
+                    return AgentResult(
+                        content=content,
+                        messages=tuple(messages),
+                        tool_invocations=tuple(invocations),
+                        run_record=run_record,
+                        tool_call_records=tuple(tool_call_records),
+                        raw_message=assistant_message,
+                    )
+
+                for tool_call in tool_calls:
+                    step_index += 1
+                    invocation, tool_message, tool_call_record = await self._invoke_tool_call(
+                        tool_call,
+                        alias_to_tool=alias_to_tool,
+                        principal=caller,
+                        request_id=call_request_id,
+                        run_id=run_id,
+                        trace_id=trace_id,
+                        round_index=round_index,
+                        step_index=step_index,
+                    )
+                    invocations.append(invocation)
+                    tool_call_records.append(tool_call_record)
+                    await self._record_agent_tool_call(tool_call_record)
+                    messages.append(tool_message)
+
+            content = "工具调用轮次已达到上限，已停止继续调用。请检查工具是否反复返回无法收敛的结果。"
+            run_record = self._build_run_record(
+                run_id=run_id,
+                request_id=call_request_id,
+                trace_id=trace_id,
+                principal=caller,
+                prompt=prompt,
+                status="stopped",
+                final_answer=content,
+                started_at=run_started,
+                tool_call_count=len(tool_call_records),
             )
-            tool_calls = _extract_tool_calls(assistant_message)
-            messages.append(_assistant_history_message(assistant_message))
-            if not tool_calls:
-                return AgentResult(
-                    content=str(assistant_message.get("content") or ""),
-                    messages=tuple(messages),
-                    tool_invocations=tuple(invocations),
-                    raw_message=assistant_message,
-                )
-
-            for tool_call in tool_calls:
-                invocation, tool_message = await self._invoke_tool_call(
-                    tool_call,
-                    alias_to_tool=alias_to_tool,
-                    principal=caller,
-                    request_id=call_request_id,
-                )
-                invocations.append(invocation)
-                messages.append(tool_message)
-
-        content = "工具调用轮次已达到上限，已停止继续调用。请检查工具是否反复返回无法收敛的结果。"
-        return AgentResult(
-            content=content,
-            messages=tuple(messages),
-            tool_invocations=tuple(invocations),
-            raw_message={"role": "assistant", "content": content},
-        )
+            await self._record_agent_run(run_record)
+            return AgentResult(
+                content=content,
+                messages=tuple(messages),
+                tool_invocations=tuple(invocations),
+                run_record=run_record,
+                tool_call_records=tuple(tool_call_records),
+                raw_message={"role": "assistant", "content": content},
+            )
+        except Exception as exc:
+            run_record = self._build_run_record(
+                run_id=run_id,
+                request_id=call_request_id,
+                trace_id=trace_id,
+                principal=caller,
+                prompt=prompt,
+                status="failed",
+                final_answer="",
+                started_at=run_started,
+                tool_call_count=len(tool_call_records),
+                error=str(exc),
+            )
+            await self._record_agent_run(run_record)
+            raise
 
     def _resolve_max_tool_rounds(self) -> int:
         if self.max_tool_rounds is not None:
             return self.max_tool_rounds
         config = getattr(self.client, "config", None)
         return int(getattr(config, "max_tool_rounds", 4))
+
+    def _build_run_record(
+        self,
+        *,
+        run_id: str,
+        request_id: str,
+        trace_id: str,
+        principal: str,
+        prompt: str,
+        status: str,
+        final_answer: str,
+        started_at: Any,
+        tool_call_count: int,
+        error: str | None = None,
+    ) -> AgentRunRecord:
+        config = getattr(self.client, "config", None)
+        return AgentRunRecord(
+            run_id=run_id,
+            request_id=request_id,
+            trace_id=trace_id,
+            agent_id=principal,
+            provider="deepseek",
+            model=str(getattr(config, "model", "")),
+            prompt_hash=stable_json_hash({"prompt": prompt}),
+            status=status,
+            final_answer=final_answer,
+            tool_call_count=tool_call_count,
+            error=error,
+            started_at=started_at,
+            finished_at=utc_now(),
+            metadata={
+                "max_tool_rounds": self._resolve_max_tool_rounds(),
+            },
+        )
+
+    async def _record_agent_run(self, record: AgentRunRecord) -> None:
+        if self.run_repository is None:
+            return
+        writer = (
+            getattr(self.run_repository, "save_run", None)
+            or getattr(self.run_repository, "record_run", None)
+            or getattr(self.run_repository, "append_run", None)
+        )
+        if writer is not None:
+            try:
+                await _maybe_await(writer(record))
+            except Exception:
+                return
+
+    async def _record_agent_tool_call(self, record: AgentToolCallRecord) -> None:
+        if self.run_repository is None:
+            return
+        writer = (
+            getattr(self.run_repository, "append_tool_call", None)
+            or getattr(self.run_repository, "record_tool_call", None)
+        )
+        if writer is not None:
+            try:
+                await _maybe_await(writer(record))
+            except Exception:
+                return
 
     async def _invoke_tool_call(
         self,
@@ -316,60 +475,186 @@ class DeepSeekToolAgent:
         alias_to_tool: Mapping[str, str],
         principal: str,
         request_id: str,
-    ) -> tuple[ToolInvocation, dict[str, Any]]:
+        run_id: str,
+        trace_id: str,
+        round_index: int,
+        step_index: int,
+    ) -> tuple[ToolInvocation, dict[str, Any], AgentToolCallRecord]:
+        call_started = utc_now()
         tool_call_id = str(tool_call.get("id") or f"call_{uuid4().hex}")
         function = tool_call.get("function") or {}
-        model_tool_name = str(function.get("name") or "")
+        model_tool_name = str(function.get("name") or "unknown_tool")
         tool_name = alias_to_tool.get(model_tool_name)
+        call_request_id = f"{request_id}:{tool_call_id}"
 
         try:
             if tool_name is None:
                 raise ValueError(f"model requested unknown tool '{model_tool_name}'")
             arguments = _parse_tool_arguments(function.get("arguments"))
             # 工具执行统一回到 ToolGateway，限流、超时、熔断、幂等不在 agent 内重复实现。
-            response = await self.gateway.ainvoke(
-                tool_name,
-                arguments,
-                principal=principal,
-                request_id=f"{request_id}:{tool_call_id}",
-            )
-            payload = {
-                "ok": True,
-                "tool_name": tool_name,
-                "result": response.result,
-                "cached": response.cached,
-            }
-            invocation = ToolInvocation(
-                tool_call_id=tool_call_id,
-                model_tool_name=model_tool_name,
+            gateway_result = await self._call_gateway_tool(
                 tool_name=tool_name,
                 arguments=arguments,
-                ok=True,
-                result=response.result,
+                principal=principal,
+                request_id=call_request_id,
+                run_id=run_id,
+                trace_id=trace_id,
+                tool_call_id=tool_call_id,
+                model_tool_name=model_tool_name,
+                round_index=round_index,
+                step_index=step_index,
             )
         except Exception as exc:  # noqa: BLE001 - tool failures must be sent back to the model.
             arguments = _safe_parse_tool_arguments(function.get("arguments"))
-            payload = _tool_error_payload(tool_name or model_tool_name, exc)
-            invocation = ToolInvocation(
-                tool_call_id=tool_call_id,
-                model_tool_name=model_tool_name,
-                tool_name=tool_name or model_tool_name,
-                arguments=arguments,
-                ok=False,
-                error=payload["error"],
-                error_type=payload["error_type"],
+            gateway_result = _gateway_invocation_from_error(exc)
+
+        resolved_tool_name = tool_name or model_tool_name
+        if gateway_result.ok:
+            payload = {
+                "ok": True,
+                "tool_name": resolved_tool_name,
+                "result": gateway_result.result,
+                "cached": gateway_result.cached,
+            }
+        else:
+            payload = {
+                "ok": False,
+                "tool_name": resolved_tool_name,
+                "error_type": gateway_result.error_type,
+                "error": gateway_result.error,
+            }
+            if gateway_result.error_code is not None:
+                payload["error_code"] = gateway_result.error_code
+
+        invocation = ToolInvocation(
+            run_id=run_id,
+            request_id=call_request_id,
+            trace_id=trace_id,
+            tool_call_id=tool_call_id,
+            round_index=round_index,
+            step_index=step_index,
+            model_tool_name=model_tool_name,
+            tool_name=resolved_tool_name,
+            arguments=arguments,
+            ok=gateway_result.ok,
+            result=gateway_result.result if gateway_result.ok else None,
+            error=gateway_result.error,
+            error_type=gateway_result.error_type,
+            error_code=gateway_result.error_code,
+            cached=gateway_result.cached,
+        )
+        record = AgentToolCallRecord(
+            run_id=run_id,
+            request_id=call_request_id,
+            trace_id=trace_id,
+            tool_call_id=tool_call_id,
+            round_index=round_index,
+            step_index=step_index,
+            model_tool_name=model_tool_name,
+            tool_name=resolved_tool_name,
+            arguments=arguments,
+            status=gateway_result.status,
+            result=gateway_result.result if gateway_result.ok else None,
+            error=gateway_result.error,
+            error_type=gateway_result.error_type,
+            error_code=gateway_result.error_code,
+            cached=gateway_result.cached,
+            server_id=_server_id_from_tool_name(resolved_tool_name),
+            started_at=call_started,
+            finished_at=utc_now(),
+            metadata={
+                "principal": principal,
+                "model_tool_name": model_tool_name,
+            },
+        )
+
+        return (
+            invocation,
+            {
+                "role": "tool",
+                "tool_call_id": tool_call_id,
+                "name": model_tool_name,
+                "content": json.dumps(payload, ensure_ascii=False, default=str),
+            },
+            record,
+        )
+
+    async def _call_gateway_tool(
+        self,
+        *,
+        tool_name: str,
+        arguments: Mapping[str, Any],
+        principal: str,
+        request_id: str,
+        run_id: str,
+        trace_id: str,
+        tool_call_id: str,
+        model_tool_name: str,
+        round_index: int,
+        step_index: int,
+    ) -> _GatewayInvocation:
+        ainvoke = getattr(self.gateway, "ainvoke", None)
+        if ainvoke is not None:
+            response = await _maybe_await(
+                ainvoke(
+                    tool_name,
+                    arguments,
+                    principal=principal,
+                    request_id=request_id,
+                )
+            )
+            return _GatewayInvocation(
+                ok=True,
+                result=getattr(response, "result", None),
+                cached=bool(getattr(response, "cached", False)),
+                status=ToolCallStatus.SUCCEEDED,
             )
 
-        return invocation, {
-            "role": "tool",
-            "tool_call_id": tool_call_id,
-            "name": model_tool_name,
-            "content": json.dumps(payload, ensure_ascii=False, default=str),
-        }
+        invoker = getattr(self.gateway, "invoke", None)
+        if invoker is None:
+            raise TypeError("gateway must expose ainvoke() or async invoke()")
+
+        server_id, context_tool_name = _split_gateway_tool_name(tool_name)
+        result = await _maybe_await(
+            invoker(
+                tool_name,
+                arguments,
+                ToolCallContext(
+                    request_id=request_id,
+                    principal=principal,
+                    tool_name=context_tool_name,
+                    server_id=server_id,
+                    trace_id=trace_id,
+                    metadata={
+                        "run_id": run_id,
+                        "tool_call_id": tool_call_id,
+                        "round_index": round_index,
+                        "step_index": step_index,
+                        "model_tool_name": model_tool_name,
+                    },
+                ),
+            )
+        )
+        if not isinstance(result, ToolResult):
+            return _GatewayInvocation(ok=True, result=result, status=ToolCallStatus.SUCCEEDED)
+        if result.success:
+            return _GatewayInvocation(
+                ok=True,
+                result=result.output,
+                cached=bool(result.metadata.get("cached", False)),
+                status=result.status,
+            )
+        return _GatewayInvocation(
+            ok=False,
+            status=result.status,
+            error=result.error_message or "tool invocation failed",
+            error_type=result.error_code or "ToolInvocationFailed",
+            error_code=result.error_code,
+        )
 
 
 def create_deepseek_agent(
-    gateway: ToolGateway,
+    gateway: Any,
     *,
     config: DeepSeekConfig | None = None,
     api_key: str | None = None,
@@ -377,6 +662,7 @@ def create_deepseek_agent(
     model: str | None = None,
     system_prompt: str = DEFAULT_SYSTEM_PROMPT,
     principal: str = "deepseek-agent",
+    run_repository: Any | None = None,
 ) -> DeepSeekToolAgent:
     resolved_config = config or DeepSeekConfig.from_env(
         api_key=api_key,
@@ -388,17 +674,18 @@ def create_deepseek_agent(
         DeepSeekChatClient(resolved_config),
         system_prompt=system_prompt,
         principal=principal,
+        run_repository=run_repository,
     )
 
 
-def _gateway_tools_for_model(gateway: ToolGateway) -> tuple[list[dict[str, Any]], dict[str, str]]:
+async def _gateway_tools_for_model(gateway: Any) -> tuple[list[dict[str, Any]], dict[str, str]]:
     aliases: dict[str, str] = {}
     tools: list[dict[str, Any]] = []
-    for metadata in gateway.list_tools():
-        original_name = str(metadata["name"])
+    for metadata in await _list_gateway_tools(gateway):
+        original_name = _tool_invocation_name(metadata)
         alias = _tool_alias(original_name, aliases)
         aliases[alias] = original_name
-        description = str(metadata.get("description") or f"Call tool {original_name}.")
+        description = str(_read_tool_metadata(metadata, "description") or f"Call tool {original_name}.")
         if alias != original_name:
             description = f"{description} Original harness tool name: {original_name}."
         tools.append(
@@ -407,11 +694,86 @@ def _gateway_tools_for_model(gateway: ToolGateway) -> tuple[list[dict[str, Any]]
                 "function": {
                     "name": alias,
                     "description": description,
-                    "parameters": _normalize_parameters(metadata.get("input_schema")),
+                    "parameters": _normalize_parameters(_read_tool_metadata(metadata, "input_schema")),
                 },
             }
         )
     return tools, aliases
+
+
+async def _list_gateway_tools(gateway: Any) -> Sequence[Any]:
+    lister = getattr(gateway, "list_tools", None)
+    if lister is not None:
+        return await _maybe_await(lister())
+
+    registry = getattr(gateway, "registry", None)
+    registry_lister = getattr(registry, "list_tools", None)
+    if registry_lister is None:
+        raise TypeError("gateway must expose list_tools() or registry.list_tools()")
+    try:
+        return await _maybe_await(registry_lister(enabled=True))
+    except TypeError:
+        return await _maybe_await(registry_lister())
+
+
+def _tool_invocation_name(metadata: Any) -> str:
+    name = str(_read_tool_metadata(metadata, "name"))
+    server_id = _read_tool_metadata(metadata, "server_id")
+    if server_id and str(server_id) != "local":
+        return f"{server_id}/{name}"
+    return name
+
+
+def _read_tool_metadata(metadata: Any, name: str, default: Any = None) -> Any:
+    if isinstance(metadata, Mapping):
+        return metadata.get(name, default)
+    return getattr(metadata, name, default)
+
+
+def _split_gateway_tool_name(tool_name: str) -> tuple[str | None, str]:
+    if "/" not in tool_name:
+        return None, tool_name
+    server_id, resolved_name = tool_name.split("/", 1)
+    return server_id or None, resolved_name
+
+
+def _server_id_from_tool_name(tool_name: str) -> str | None:
+    server_id, _ = _split_gateway_tool_name(tool_name)
+    return server_id
+
+
+async def _maybe_await(value: Any) -> Any:
+    if hasattr(value, "__await__"):
+        return await value
+    return value
+
+
+def _gateway_invocation_from_error(exc: Exception) -> _GatewayInvocation:
+    payload = _tool_error_payload("", exc)
+    if isinstance(exc, ToolHarnessError):
+        error_code = exc.error_code
+    else:
+        error_code = payload.get("error_code")
+    status = _tool_call_status_from_error_code(error_code)
+    return _GatewayInvocation(
+        ok=False,
+        status=status,
+        error=payload["error"],
+        error_type=payload["error_type"],
+        error_code=error_code,
+    )
+
+
+def _tool_call_status_from_error_code(error_code: str | None) -> ToolCallStatus:
+    if error_code == "rate_limit_exceeded":
+        return ToolCallStatus.RATE_LIMITED
+    if error_code == "circuit_open":
+        return ToolCallStatus.CIRCUIT_OPEN
+    if error_code == "approval_required":
+        return ToolCallStatus.PENDING_APPROVAL
+    if error_code == "permission_denied":
+        return ToolCallStatus.DENIED
+    return ToolCallStatus.FAILED
 
 
 def _tool_alias(name: str, existing: Mapping[str, str]) -> str:
@@ -502,8 +864,8 @@ def _compact_error(body: str) -> str:
     return text
 
 
-def _build_demo_gateway() -> ToolGateway:
-    gateway = ToolGateway(default_rate_limit_per_minute=120, default_timeout_ms=2_000)
+def _build_demo_gateway() -> SimpleToolGateway:
+    gateway = SimpleToolGateway(default_rate_limit_per_minute=120, default_timeout_ms=2_000)
 
     def add(left: int, right: int) -> dict[str, int]:
         return {"value": left + right}
