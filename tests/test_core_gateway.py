@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from typing import Any
 
 import pytest
@@ -7,6 +8,7 @@ import pytest
 from mcp_tool_harness.core import Registry, ToolCallContext, ToolSpec
 from mcp_tool_harness.core.gateway import ToolGateway
 from mcp_tool_harness.mcp.client import InMemoryTransport, MCPClient
+from mcp_tool_harness.runtime import InMemoryIdempotencyStore
 from mcp_tool_harness.storage import InMemoryAuditRepository
 
 
@@ -153,3 +155,211 @@ async def test_core_gateway_does_not_hide_registry_identity_failures() -> None:
         await gateway.invoke("math.add", {}, context)
 
     assert transport.requests == []
+
+
+@pytest.mark.asyncio
+async def test_core_gateway_replays_completed_result_for_same_tool_arguments() -> None:
+    registry = Registry()
+    await registry.register_tool(
+        ToolSpec(
+            name="order.create",
+            description="Create order",
+            input_schema={
+                "type": "object",
+                "properties": {"sku": {"type": "string"}},
+                "required": ["sku"],
+            },
+        )
+    )
+    calls: list[str] = []
+    transport = InMemoryTransport()
+    transport.add_tool(
+        "order.create",
+        lambda args: calls.append(args["sku"]) or {"sku": args["sku"], "sequence": len(calls)},
+    )
+    gateway = ToolGateway(
+        registry=registry,
+        security=None,
+        mcp_client=MCPClient.with_mock(transport),
+        idempotency_store=InMemoryIdempotencyStore(default_ttl=60),
+    )
+
+    first = await gateway.invoke(
+        "order.create",
+        {"sku": "SKU-1"},
+        ToolCallContext(request_id="dedupe-1", principal="agent-a", tool_name="order.create"),
+    )
+    second = await gateway.invoke(
+        "order.create",
+        {"sku": "SKU-1"},
+        ToolCallContext(request_id="dedupe-2", principal="agent-a", tool_name="order.create"),
+    )
+
+    assert first.success is True
+    assert second.success is True
+    assert second.output == first.output
+    assert second.metadata["cached"] is True
+    assert second.metadata["idempotency_reason"] == "completed_replay"
+    assert calls == ["SKU-1"]
+
+
+@pytest.mark.asyncio
+async def test_core_gateway_rejects_explicit_key_reuse_with_different_arguments() -> None:
+    registry = Registry()
+    await registry.register_tool(
+        ToolSpec(
+            name="order.create",
+            description="Create order",
+            input_schema={
+                "type": "object",
+                "properties": {"sku": {"type": "string"}},
+                "required": ["sku"],
+            },
+        )
+    )
+    calls: list[str] = []
+    transport = InMemoryTransport()
+    transport.add_tool("order.create", lambda args: calls.append(args["sku"]) or {"sku": args["sku"]})
+    gateway = ToolGateway(
+        registry=registry,
+        security=None,
+        mcp_client=MCPClient.with_mock(transport),
+        idempotency_store=InMemoryIdempotencyStore(default_ttl=60),
+    )
+
+    first = await gateway.invoke(
+        "order.create",
+        {"sku": "SKU-1"},
+        ToolCallContext(
+            request_id="conflict-1",
+            principal="agent-a",
+            tool_name="order.create",
+            idempotency_key="manual-key-1",
+        ),
+    )
+    second = await gateway.invoke(
+        "order.create",
+        {"sku": "SKU-2"},
+        ToolCallContext(
+            request_id="conflict-2",
+            principal="agent-a",
+            tool_name="order.create",
+            idempotency_key="manual-key-1",
+        ),
+    )
+
+    assert first.success is True
+    assert second.success is False
+    assert second.error_code == "IDEMPOTENCY_CONFLICT"
+    assert second.metadata["idempotency_reason"] == "fingerprint_mismatch"
+    assert calls == ["SKU-1"]
+
+
+@pytest.mark.asyncio
+async def test_core_gateway_rejects_duplicate_while_first_call_is_in_progress() -> None:
+    class SlowMCPClient:
+        def __init__(self) -> None:
+            self.calls = 0
+            self.started = asyncio.Event()
+            self.release = asyncio.Event()
+
+        async def call_tool(self, _name: str, arguments: dict[str, Any]) -> dict[str, Any]:
+            self.calls += 1
+            self.started.set()
+            await self.release.wait()
+            return {"structuredContent": {"sku": arguments["sku"], "sequence": self.calls}}
+
+    registry = Registry()
+    await registry.register_tool(
+        ToolSpec(
+            name="order.create",
+            description="Create order",
+            input_schema={
+                "type": "object",
+                "properties": {"sku": {"type": "string"}},
+                "required": ["sku"],
+            },
+        )
+    )
+    client = SlowMCPClient()
+    gateway = ToolGateway(
+        registry=registry,
+        security=None,
+        mcp_client=client,
+        idempotency_store=InMemoryIdempotencyStore(default_ttl=60),
+    )
+    first_context = ToolCallContext(
+        request_id="in-progress-1",
+        principal="agent-a",
+        tool_name="order.create",
+    )
+    second_context = ToolCallContext(
+        request_id="in-progress-2",
+        principal="agent-a",
+        tool_name="order.create",
+    )
+
+    first_task = asyncio.create_task(gateway.invoke("order.create", {"sku": "SKU-1"}, first_context))
+    await client.started.wait()
+    second = await gateway.invoke("order.create", {"sku": "SKU-1"}, second_context)
+    client.release.set()
+    first = await first_task
+
+    assert first.success is True
+    assert second.success is False
+    assert second.error_code == "IDEMPOTENCY_IN_PROGRESS"
+    assert client.calls == 1
+
+
+@pytest.mark.asyncio
+async def test_core_gateway_allows_failed_duplicate_retries_until_attempt_cap() -> None:
+    class FailingMCPClient:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def call_tool(self, _name: str, _arguments: dict[str, Any]) -> dict[str, Any]:
+            self.calls += 1
+            raise RuntimeError("temporary tool failure")
+
+    registry = Registry()
+    await registry.register_tool(
+        ToolSpec(
+            name="order.create",
+            description="Create order",
+            input_schema={
+                "type": "object",
+                "properties": {"sku": {"type": "string"}},
+                "required": ["sku"],
+            },
+        )
+    )
+    client = FailingMCPClient()
+    gateway = ToolGateway(
+        registry=registry,
+        security=None,
+        mcp_client=client,
+        idempotency_store=InMemoryIdempotencyStore(default_ttl=60, max_attempts=2),
+    )
+
+    first = await gateway.invoke(
+        "order.create",
+        {"sku": "SKU-1"},
+        ToolCallContext(request_id="retry-1", principal="agent-a", tool_name="order.create"),
+    )
+    second = await gateway.invoke(
+        "order.create",
+        {"sku": "SKU-1"},
+        ToolCallContext(request_id="retry-2", principal="agent-a", tool_name="order.create"),
+    )
+    third = await gateway.invoke(
+        "order.create",
+        {"sku": "SKU-1"},
+        ToolCallContext(request_id="retry-3", principal="agent-a", tool_name="order.create"),
+    )
+
+    assert first.error_code == "RuntimeError"
+    assert second.error_code == "RuntimeError"
+    assert third.success is False
+    assert third.error_code == "IDEMPOTENCY_RETRY_EXHAUSTED"
+    assert third.metadata["idempotency_attempt_count"] == 2
+    assert client.calls == 2

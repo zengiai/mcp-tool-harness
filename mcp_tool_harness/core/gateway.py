@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import inspect
 from collections.abc import Awaitable, Callable, Mapping
+from dataclasses import replace
 from typing import Any
 
 from .models import (
@@ -86,7 +87,7 @@ class ToolGateway:
         tool = await self._get_tool(tool_name, version)
         resolved_tool_name = self._tool_name(tool)
         timeout_ms = await self._resolve_timeout_ms(tool, context)
-        idempotency_key = context.idempotency_key
+        idempotency_key: str | None = None
         idempotency_started = False
         audit_result: ToolResult | None = None
         audit_decision = PolicyDecision.allowed("policy not evaluated")
@@ -144,28 +145,32 @@ class ToolGateway:
                     )
                     return audit_result
 
-            # 幂等记录只包住真正的执行阶段，确保重试不会重复触发写操作类工具。
-            if idempotency_key and self.idempotency_store is not None:
-                cached = await self._get_cached_idempotent_result(idempotency_key)
-                if cached is not None:
-                    audit_result = cached
-                    status = cached.status
-                    error_code = cached.error_code
-                    return cached
-                idempotency_started = await self._start_idempotency(
-                    idempotency_key,
+            # 幂等记录只包住真正的执行阶段，按工具、参数和调用主体做自动去重。
+            if self.idempotency_store is not None:
+                idempotency_key, idempotency_started, idempotency_result = await self._prepare_idempotency(
                     tool,
                     normalized_args,
                     context,
                 )
+                if idempotency_result is not None:
+                    audit_result = idempotency_result
+                    status = idempotency_result.status
+                    error_code = idempotency_result.error_code
+                    return idempotency_result
 
             # 真实调用统一收敛到 MCP client；RPC 工具也应先包装成 MCP/Harness tool 再进入这里。
             result = await self._execute_with_protection(tool, normalized_args, context, timeout_ms)
             audit_result = result
             status = result.status
             error_code = result.error_code
-            if idempotency_key and self.idempotency_store is not None and result.success:
-                await self._store_idempotent_success(idempotency_key, result, idempotency_started)
+            if idempotency_key and self.idempotency_store is not None:
+                if result.success:
+                    await self._store_idempotent_success(idempotency_key, result, idempotency_started)
+                elif idempotency_started:
+                    await self._store_idempotent_failure(
+                        idempotency_key,
+                        result.error_code or result.error_message or "tool result failed",
+                    )
             return result
         except TimeoutError as exc:
             status = ToolCallStatus.FAILED
@@ -564,6 +569,45 @@ class ToolGateway:
             await self._maybe_await(record_success())
         return result
 
+    async def _prepare_idempotency(
+        self,
+        tool: Any,
+        args: Mapping[str, Any],
+        context: ToolCallContext,
+    ) -> tuple[str, bool, ToolResult | None]:
+        key = self._idempotency_key(tool, args, context)
+        starter = getattr(self.idempotency_store, "start", None)
+        if starter is None:
+            cached = await self._get_cached_idempotent_result(key)
+            if cached is not None:
+                return key, False, self._mark_idempotent_replay(key, cached, "completed_replay")
+            return key, False, None
+
+        fingerprint = self._idempotency_fingerprint(tool, args, context)
+        decision = await self._maybe_await(
+            starter(
+                key,
+                fingerprint=fingerprint,
+                metadata={
+                    "trace_id": context.trace_id,
+                    "request_id": context.request_id,
+                    "auto_key": context.idempotency_key is None,
+                },
+            )
+        )
+        if getattr(decision, "replay", False):
+            record = getattr(decision, "record", None)
+            result = getattr(record, "result", None)
+            if isinstance(result, ToolResult):
+                return key, False, self._mark_idempotent_replay(
+                    key,
+                    result,
+                    getattr(decision, "reason", "completed_replay"),
+                )
+        if not getattr(decision, "accepted", False):
+            return key, False, self._idempotency_rejected_result(key, decision, context)
+        return key, True, None
+
     async def _get_cached_idempotent_result(self, key: str) -> ToolResult | None:
         getter = getattr(self.idempotency_store, "get", None)
         if getter is None:
@@ -580,30 +624,81 @@ class ToolGateway:
                 return result
         return None
 
-    async def _start_idempotency(
+    def _idempotency_key(
         self,
-        key: str,
         tool: Any,
         args: Mapping[str, Any],
         context: ToolCallContext,
-    ) -> bool:
-        starter = getattr(self.idempotency_store, "start", None)
-        if starter is None:
-            return False
-        # fingerprint 绑定工具名、参数和调用主体，防止同一个幂等 key 被不同请求复用。
-        fingerprint = stable_json_hash(
-            {"tool_name": self._tool_name(tool), "args": args, "principal": context.principal}
+    ) -> str:
+        if context.idempotency_key:
+            return context.idempotency_key
+        return f"auto:{stable_json_hash(self._idempotency_scope(tool, args, context))}"
+
+    def _idempotency_fingerprint(
+        self,
+        tool: Any,
+        args: Mapping[str, Any],
+        context: ToolCallContext,
+    ) -> str:
+        return stable_json_hash(self._idempotency_scope(tool, args, context))
+
+    def _idempotency_scope(
+        self,
+        tool: Any,
+        args: Mapping[str, Any],
+        context: ToolCallContext,
+    ) -> dict[str, Any]:
+        return {
+            "server_id": str(getattr(tool, "server_id", None) or context.server_id or "local"),
+            "tool_name": self._tool_name(tool),
+            "tenant_id": context.tenant_id,
+            "principal": context.principal,
+            "args": args,
+        }
+
+    @staticmethod
+    def _mark_idempotent_replay(key: str, result: ToolResult, reason: str) -> ToolResult:
+        metadata = dict(result.metadata)
+        metadata.update(
+            {
+                "cached": True,
+                "idempotency_hit": True,
+                "idempotency_key": key,
+                "idempotency_reason": reason,
+            }
         )
-        decision = await self._maybe_await(
-            starter(
-                key,
-                fingerprint=fingerprint,
-                metadata={"trace_id": context.trace_id, "request_id": context.request_id},
-            )
+        return replace(result, metadata=metadata)
+
+    def _idempotency_rejected_result(
+        self,
+        key: str,
+        decision: Any,
+        context: ToolCallContext,
+    ) -> ToolResult:
+        reason = str(getattr(decision, "reason", "") or "rejected")
+        error_code = {
+            "fingerprint_mismatch": "IDEMPOTENCY_CONFLICT",
+            "already_in_progress": "IDEMPOTENCY_IN_PROGRESS",
+            "failed_not_retryable": "IDEMPOTENCY_FAILED_NOT_RETRYABLE",
+            "failed_retry_exhausted": "IDEMPOTENCY_RETRY_EXHAUSTED",
+        }.get(reason, "IDEMPOTENCY_REJECTED")
+        result = ToolResult.failed(
+            call_id=context.call_id,
+            trace_id=context.trace_id,
+            error_code=error_code,
+            error_message=f"idempotency rejected: {reason}",
+            status=ToolCallStatus.FAILED,
         )
-        if getattr(decision, "replay", False):
-            return False
-        return bool(getattr(decision, "accepted", False))
+        record = getattr(decision, "record", None)
+        result.metadata.update(
+            {
+                "idempotency_key": key,
+                "idempotency_reason": reason,
+                "idempotency_rejected": True,
+                "idempotency_attempt_count": getattr(record, "attempt_count", None),
+            }
+        )
+        return result
 
     async def _store_idempotent_success(self, key: str, result: ToolResult, started: bool) -> None:
         if started and hasattr(self.idempotency_store, "complete"):
@@ -613,7 +708,7 @@ class ToolGateway:
         if putter is not None:
             await self._maybe_await(putter(key, result))
 
-    async def _store_idempotent_failure(self, key: str, exc: BaseException) -> None:
+    async def _store_idempotent_failure(self, key: str, exc: BaseException | str) -> None:
         if hasattr(self.idempotency_store, "fail"):
             await self._maybe_await(self.idempotency_store.fail(key, exc))
 
