@@ -9,6 +9,7 @@ from dataclasses import dataclass, field, is_dataclass, asdict
 from typing import Any, Iterable, Mapping, Sequence, TYPE_CHECKING
 
 from .models import PolicyDecision
+from mcp_tool_harness.runtime.circuit_breaker import CircuitBreakerConfig
 
 if TYPE_CHECKING:  # pragma: no cover - optional integration surface.
     from .models import Principal, ToolCall, ToolCallContext, ToolDefinition, ToolPolicy  # noqa: F401
@@ -595,6 +596,34 @@ class PolicyAwareSecurity:
         except (TypeError, ValueError):
             return None
         return timeout if timeout > 0 else None
+
+    async def resolve_circuit_config(
+        self,
+        context: "ToolCallContext",
+        tool: Any,
+    ) -> "CircuitBreakerConfig | None":
+        """Resolve per-tool circuit breaker config from the matching ToolPolicy.
+
+        Returns ``None`` only when no policy exists at all.  Otherwise every
+        ``CircuitBreakerConfig`` field receives a concrete value, falling back
+        to the ToolPolicy default when the YAML key is absent.
+        """
+        policy = await self._resolve_policy(context, tool)
+        if policy is None:
+            return None
+
+        # fallback 值对齐 ToolPolicy / CircuitBreakerConfig 的默认值。
+        threshold = int(_read(policy, "circuit_failure_threshold", 5))
+        reset_timeout = float(_read(policy, "circuit_reset_timeout_seconds", 30))
+        success_threshold = int(_read(policy, "circuit_success_threshold", 2))
+        half_open_max = int(_read(policy, "circuit_half_open_max_calls", 1))
+
+        return CircuitBreakerConfig(
+            failure_threshold=threshold,
+            recovery_timeout=reset_timeout,
+            success_threshold=success_threshold,
+            half_open_max_calls=half_open_max,
+        )
 
     async def resolve_policy(self, context: "ToolCallContext", tool: Any) -> "ToolPolicy | None":
         return await self._resolve_policy(context, tool)

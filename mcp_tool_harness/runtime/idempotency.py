@@ -25,6 +25,7 @@ class IdempotencyRecord:
     fingerprint: str | None = None
     result: Any = None
     error: str | None = None
+    attempt_count: int = 0
     metadata: Mapping[str, Any] = field(default_factory=dict)
     created_at: float = field(default_factory=time.monotonic)
     updated_at: float = field(default_factory=time.monotonic)
@@ -44,11 +45,20 @@ class IdempotencyDecision:
 
 
 class InMemoryIdempotencyStore:
-    def __init__(self, *, default_ttl: float = 300.0, retry_failed: bool = True) -> None:
+    def __init__(
+        self,
+        *,
+        default_ttl: float = 300.0,
+        retry_failed: bool = True,
+        max_attempts: int = 3,
+    ) -> None:
         if default_ttl <= 0:
             raise ValueError("default_ttl must be positive")
+        if max_attempts <= 0:
+            raise ValueError("max_attempts must be positive")
         self.default_ttl = default_ttl
         self.retry_failed = retry_failed
+        self.max_attempts = max_attempts
         self._records: dict[str, IdempotencyRecord] = {}
         self._lock = asyncio.Lock()
 
@@ -70,6 +80,8 @@ class InMemoryIdempotencyStore:
                 self._records.pop(key, None)
                 existing = None
 
+            attempt_count = 1
+            created_at: float | None = None
             if existing is not None:
                 if existing.fingerprint and fingerprint and existing.fingerprint != fingerprint:
                     return IdempotencyDecision(False, False, False, existing, "fingerprint_mismatch")
@@ -79,14 +91,26 @@ class InMemoryIdempotencyStore:
                     return IdempotencyDecision(False, False, True, existing, "already_in_progress")
                 if existing.status == IdempotencyStatus.FAILED and not self.retry_failed:
                     return IdempotencyDecision(False, False, False, existing, "failed_not_retryable")
+                if existing.status == IdempotencyStatus.FAILED:
+                    if existing.attempt_count >= self.max_attempts:
+                        return IdempotencyDecision(
+                            False,
+                            False,
+                            False,
+                            existing,
+                            "failed_retry_exhausted",
+                        )
+                    attempt_count = existing.attempt_count + 1
+                    created_at = existing.created_at
 
             now = time.monotonic()
             record = IdempotencyRecord(
                 key=key,
                 status=IdempotencyStatus.IN_PROGRESS,
                 fingerprint=fingerprint,
+                attempt_count=attempt_count,
                 metadata=metadata or {},
-                created_at=now,
+                created_at=created_at or now,
                 updated_at=now,
                 expires_at=now + ttl,
             )
@@ -163,6 +187,7 @@ class InMemoryIdempotencyStore:
                     "status": record.status.value,
                     "fingerprint": record.fingerprint,
                     "error": record.error,
+                    "attempt_count": record.attempt_count,
                     "metadata": dict(record.metadata),
                     "created_at": record.created_at,
                     "updated_at": record.updated_at,
