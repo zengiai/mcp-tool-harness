@@ -17,3 +17,5 @@ dist/
 
 .env
 .env.*
+
+AGENTS.md

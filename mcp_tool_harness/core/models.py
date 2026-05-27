@@ -269,6 +269,8 @@ class ToolPolicy(JsonModelMixin):
     timeout_ms: int | None = None
     circuit_failure_threshold: int = 5
     circuit_reset_timeout_seconds: int = 30
+    circuit_success_threshold: int = 2
+    circuit_half_open_max_calls: int = 1
     audit_enabled: bool = True
     metadata: dict[str, Any] = field(default_factory=dict)
     policy_id: str = ""
@@ -291,6 +293,10 @@ class ToolPolicy(JsonModelMixin):
             raise ValueError("circuit_failure_threshold must be positive")
         if self.circuit_reset_timeout_seconds <= 0:
             raise ValueError("circuit_reset_timeout_seconds must be positive")
+        if self.circuit_success_threshold <= 0:
+            raise ValueError("circuit_success_threshold must be positive")
+        if self.circuit_half_open_max_calls <= 0:
+            raise ValueError("circuit_half_open_max_calls must be positive")
         self.allowed_principals = frozenset(self.allowed_principals)
         self.denied_principals = frozenset(self.denied_principals)
         self.allowed_agents = frozenset(self.allowed_agents)

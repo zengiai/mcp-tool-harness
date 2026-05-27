@@ -257,6 +257,20 @@ class ToolGateway:
                 return int(timeout)
         return int(getattr(tool, "timeout_ms", None) or self.default_timeout_ms)
 
+    async def _resolve_circuit_config(self, tool: Any, context: ToolCallContext) -> Any | None:
+        """Resolve per‑tool circuit breaker config from the attached security component.
+
+        Returns a :class:`CircuitBreakerConfig` when the underlying
+        ``resolve_circuit_config`` method is present on the security adapter,
+        or ``None`` otherwise so the gateway falls back to the injected
+        ``self.circuit_breaker`` as‑is.
+        """
+        if self.security is not None and hasattr(self.security, "resolve_circuit_config"):
+            return await self._maybe_await(
+                self.security.resolve_circuit_config(context, tool)
+            )
+        return None
+
     async def _check_permission(
         self,
         context: ToolCallContext,
@@ -330,11 +344,15 @@ class ToolGateway:
         async def call_mcp() -> Any:
             return await self._call_mcp_tool(tool_name, args, context, tool)
 
+        # 从 YAML 策略中解析熔断配置；未配置则走 Gateway 注入的全局默认熔断器。
+        circuit_config = await self._resolve_circuit_config(tool, context)
+
         # 熔断器只包住下游调用，不包住本地校验/鉴权，避免策略失败污染下游健康状态。
         if self.circuit_breaker is not None:
             protected_call: Callable[[], Awaitable[Any]] = lambda: self._call_with_circuit(
                 tool_name,
                 call_mcp,
+                circuit_config=circuit_config,
             )
         else:
             protected_call = call_mcp
@@ -538,11 +556,20 @@ class ToolGateway:
         # 只传递 MCP Client 声明支持的扩展参数，兼容同步 client、异步 client 和测试 mock。
         return await self._maybe_await(caller(tool_name, dict(args), **kwargs))
 
-    async def _call_with_circuit(self, tool_name: str, call_mcp: Callable[[], Awaitable[Any]]) -> Any:
+    async def _call_with_circuit(
+        self,
+        tool_name: str,
+        call_mcp: Callable[[], Awaitable[Any]],
+        *,
+        circuit_config: Any | None = None,
+    ) -> Any:
         breaker = self.circuit_breaker
         getter = getattr(breaker, "get", None)
         if getter is not None:
-            breaker = await self._maybe_await(getter(tool_name))
+            if circuit_config is not None:
+                breaker = await self._maybe_await(getter(tool_name, circuit_config))
+            else:
+                breaker = await self._maybe_await(getter(tool_name))
 
         # 兼容两种熔断器 API：一类提供 call 包装器，另一类提供 before/success/failure 三段式。
         caller = getattr(breaker, "call", None)
