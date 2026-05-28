@@ -377,6 +377,13 @@ result = await gateway.invoke(
 - `Tracer`
 
 Gateway 支持注入 `audit` 和 `metrics`，调用完成后记录状态、耗时、错误码和上下文。
+如果没有显式注入 `audit`，核心 `ToolGateway` 默认会写 JSON Lines 审计文件
+`logs/tool-audit.jsonl`；可通过环境变量 `MCP_TOOL_HARNESS_AUDIT_LOG_PATH`
+覆盖路径。`ToolPolicy.audit_enabled=false` 会关闭对应工具策略命中的审计写入，
+但不会影响指标记录或工具调用结果。
+如果没有显式注入 `metrics`，核心 `ToolGateway` 默认会写 JSON Lines 指标文件
+`logs/tool-metrics.jsonl`；可通过环境变量 `MCP_TOOL_HARNESS_METRICS_LOG_PATH`
+覆盖路径。
 
 ```python
 from mcp_tool_harness.core.audit import JsonLinesAuditSink, AsyncAuditLogger
@@ -437,6 +444,22 @@ uvicorn app:app --host 127.0.0.1 --port 8000
 ```bash
 curl http://127.0.0.1:8000/tools
 ```
+
+打开本地控制台：
+
+```text
+http://127.0.0.1:8000/console
+```
+
+控制台提供 Tool、Chain、Metrics 三个侧边栏页签：
+
+- Tool：当前实例注册的工具。
+- Chain：从 audit JSONL 聚合出的调用链列表与详情。
+- Metrics：从 metrics JSONL 聚合出的工具调用次数、状态分布和延迟摘要。
+
+当前控制台不做鉴权，生产环境应只暴露在可信内部网络，或在外层接入统一认证与访问控制。
+控制台前端资源已拆分到 `mcp_tool_harness/server/console/`，后续可以分别维护
+`index.html`、`console.css` 和 `console.js`，不需要在路由代码里修改大段内联页面。
 
 HTTP 调用工具：
 

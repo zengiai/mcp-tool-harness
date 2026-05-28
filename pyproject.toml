@@ -11,3 +11,6 @@ dependencies = []
 
 [tool.setuptools.packages.find]
 include = ["mcp_tool_harness*"]
+
+[tool.setuptools.package-data]
+"mcp_tool_harness.server" = ["console/*.html", "console/*.css", "console/*.js"]

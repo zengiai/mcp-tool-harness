@@ -1,0 +1,52 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>MCP Tool Harness Console</title>
+  <link rel="icon" href="data:,">
+  <link rel="stylesheet" href="/console/assets/console.css">
+  <script src="/console/assets/console.js" defer></script>
+</head>
+<body>
+  <div class="layout">
+    <aside>
+      <p class="brand">MCP Tool Harness</p>
+      <nav aria-label="Console sections">
+        <button class="tab" data-tab="tool" aria-selected="true">Tool</button>
+        <button class="tab" data-tab="chain" aria-selected="false">Chain</button>
+        <button class="tab" data-tab="metrics" aria-selected="false">Metrics</button>
+      </nav>
+    </aside>
+    <main>
+      <header>
+        <div>
+          <h1 id="title">Tool</h1>
+          <div class="muted" id="subtitle">Current instance tool registry</div>
+        </div>
+        <div class="toolbar">
+          <button class="refresh" id="refresh">Refresh</button>
+        </div>
+      </header>
+
+      <section class="view active" id="view-tool">
+        <div class="panel" id="tools"></div>
+      </section>
+
+      <section class="view" id="view-chain">
+        <div class="split">
+          <div class="panel" id="chains"></div>
+          <div class="panel">
+            <pre id="chain-detail">Select a chain.</pre>
+          </div>
+        </div>
+      </section>
+
+      <section class="view" id="view-metrics">
+        <div class="summary" id="metric-summary"></div>
+        <div class="panel" id="metrics-table"></div>
+      </section>
+    </main>
+  </div>
+</body>
+</html>

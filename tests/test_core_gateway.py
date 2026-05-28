@@ -1,11 +1,18 @@
 from __future__ import annotations
 
+import json
+from pathlib import Path
 import asyncio
 from typing import Any
 
 import pytest
 
-from mcp_tool_harness.core import Registry, ToolCallContext, ToolSpec
+from mcp_tool_harness.core import (
+    Registry,
+    ToolCallContext,
+    ToolPolicy,
+    ToolSpec,
+)
 from mcp_tool_harness.core.gateway import ToolGateway
 from mcp_tool_harness.mcp.client import InMemoryTransport, MCPClient
 from mcp_tool_harness.runtime import InMemoryIdempotencyStore
@@ -132,6 +139,178 @@ async def test_core_gateway_records_tool_call_to_audit_repository() -> None:
     assert record.metadata["run_id"] == "run-1"
     assert record.metadata["tool_call_id"] == "tool-call-1"
     assert record.metadata["arguments"] == {"left": 2, "right": 3}
+
+
+@pytest.mark.asyncio
+async def test_core_gateway_writes_default_json_audit_file(audit_log_path: Path) -> None:
+    registry = Registry()
+    tool = await registry.register_tool(
+        ToolSpec(
+            name="math.add",
+            description="Add two integers",
+            input_schema={
+                "type": "object",
+                "properties": {
+                    "left": {"type": "integer"},
+                    "right": {"type": "integer"},
+                },
+                "required": ["left", "right"],
+            },
+        )
+    )
+    transport = InMemoryTransport()
+    transport.add_tool("math.add", lambda args: {"value": args["left"] + args["right"]})
+    gateway = ToolGateway(
+        registry=registry,
+        security=None,
+        mcp_client=MCPClient.with_mock(transport),
+    )
+    context = ToolCallContext(
+        request_id="call-json-audit-1",
+        principal="agent-a",
+        tool_name="math.add",
+        tenant_id="tenant-a",
+        trace_id="trace-json-audit-1",
+        metadata={"run_id": "run-json-1"},
+    )
+
+    result = await gateway.invoke("math.add", {"left": 2, "right": 3}, context)
+
+    assert result.success is True
+    lines = audit_log_path.read_text(encoding="utf-8").splitlines()
+    assert len(lines) == 1
+    event = json.loads(lines[0])
+    assert event["event_type"] == "tool_call"
+    assert event["actor"] == "agent-a"
+    assert event["action"] == "math.add"
+    assert event["resource"] == "local/math.add"
+    assert event["outcome"] == "success"
+    assert event["request_id"] == "call-json-audit-1"
+    assert event["correlation_id"] == "trace-json-audit-1"
+    metadata = event["metadata"]
+    assert metadata["schema_version"] == "tool_call_audit.v1"
+    assert metadata["request_id"] == "call-json-audit-1"
+    assert metadata["trace_id"] == "trace-json-audit-1"
+    assert metadata["principal"] == "agent-a"
+    assert metadata["tenant_id"] == "tenant-a"
+    assert metadata["server_id"] == "local"
+    assert metadata["tool_name"] == "math.add"
+    assert metadata["tool_id"] == tool.tool_id
+    assert metadata["status"] == "succeeded"
+    assert metadata["error_code"] is None
+    assert metadata["result_success"] is True
+    assert metadata["result_status"] == "succeeded"
+    assert metadata["arguments"] == {"left": 2, "right": 3}
+    assert metadata["context_metadata"] == {"run_id": "run-json-1"}
+
+
+@pytest.mark.asyncio
+async def test_core_gateway_writes_default_json_metrics_file(metrics_log_path: Path) -> None:
+    registry = Registry()
+    await registry.register_tool(ToolSpec(name="math.add", description="Add two integers"))
+    transport = InMemoryTransport()
+    transport.add_tool("math.add", lambda args: {"value": args["left"] + args["right"]})
+    gateway = ToolGateway(
+        registry=registry,
+        security=None,
+        mcp_client=MCPClient.with_mock(transport),
+    )
+    context = ToolCallContext(
+        request_id="call-json-metrics-1",
+        principal="agent-a",
+        tool_name="math.add",
+        trace_id="trace-json-metrics-1",
+    )
+
+    result = await gateway.invoke("math.add", {"left": 2, "right": 3}, context)
+
+    assert result.success is True
+    lines = metrics_log_path.read_text(encoding="utf-8").splitlines()
+    assert len(lines) == 1
+    event = json.loads(lines[0])
+    assert event["schema_version"] == "tool_metrics.v1"
+    assert event["event_type"] == "tool_call_metrics"
+    assert event["metric_name"] == "tool_call"
+    assert event["tool_name"] == "math.add"
+    assert event["status"] == "succeeded"
+    assert event["latency_ms"] >= 0
+    assert event["labels"] == {"status": "succeeded", "tool_name": "math.add"}
+    assert event["counters"] == {"tool_call_total": 1}
+    assert event["histograms"]["tool_call_latency_ms"] >= 0
+
+
+@pytest.mark.asyncio
+async def test_core_gateway_respects_tool_policy_audit_disabled() -> None:
+    registry = Registry()
+    await registry.register_tool(
+        ToolSpec(name="math.add", description="Add two integers"),
+        policy=ToolPolicy(
+            tool_name="math.add",
+            allowed_agents=frozenset({"*"}),
+            audit_enabled=False,
+        ),
+    )
+    transport = InMemoryTransport()
+    transport.add_tool("math.add", lambda args: {"value": args["left"] + args["right"]})
+    audit = InMemoryAuditRepository()
+    gateway = ToolGateway(
+        registry=registry,
+        security=None,
+        mcp_client=MCPClient.with_mock(transport),
+        audit=audit,
+    )
+    context = ToolCallContext(
+        request_id="call-audit-disabled-1",
+        principal="agent-a",
+        tool_name="math.add",
+    )
+
+    result = await gateway.invoke("math.add", {"left": 2, "right": 3}, context)
+
+    assert result.success is True
+    assert result.output == {"value": 5}
+    assert await audit.list_records(request_id="call-audit-disabled-1") == []
+
+
+@pytest.mark.asyncio
+async def test_core_gateway_audit_disabled_suppresses_validation_failure_record() -> None:
+    registry = Registry()
+    await registry.register_tool(
+        ToolSpec(
+            name="math.add",
+            description="Add two integers",
+            input_schema={
+                "type": "object",
+                "properties": {"left": {"type": "integer"}},
+                "required": ["left"],
+            },
+        ),
+        policy=ToolPolicy(
+            tool_name="math.add",
+            allowed_agents=frozenset({"*"}),
+            audit_enabled=False,
+        ),
+    )
+    transport = InMemoryTransport()
+    audit = InMemoryAuditRepository()
+    gateway = ToolGateway(
+        registry=registry,
+        security=None,
+        mcp_client=MCPClient.with_mock(transport),
+        audit=audit,
+    )
+    context = ToolCallContext(
+        request_id="call-audit-disabled-validation-1",
+        principal="agent-a",
+        tool_name="math.add",
+    )
+
+    result = await gateway.invoke("math.add", {}, context)
+
+    assert result.success is False
+    assert result.error_code == "ToolInputValidationError"
+    assert transport.requests == []
+    assert await audit.list_records(request_id="call-audit-disabled-validation-1") == []
 
 
 @pytest.mark.asyncio

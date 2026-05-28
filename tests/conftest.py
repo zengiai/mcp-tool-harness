@@ -19,3 +19,17 @@ def clock() -> dict[str, float]:
 @pytest.fixture
 def time_func(clock: dict[str, float]):
     return lambda: clock["now"]
+
+
+@pytest.fixture(autouse=True)
+def audit_log_path(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    path = tmp_path / "tool-audit.jsonl"
+    monkeypatch.setenv("MCP_TOOL_HARNESS_AUDIT_LOG_PATH", str(path))
+    return path
+
+
+@pytest.fixture(autouse=True)
+def metrics_log_path(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    path = tmp_path / "tool-metrics.jsonl"
+    monkeypatch.setenv("MCP_TOOL_HARNESS_METRICS_LOG_PATH", str(path))
+    return path

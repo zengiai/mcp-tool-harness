@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import enum
 import json
+import os
 import time
 import uuid
 from dataclasses import asdict, dataclass, field, is_dataclass
@@ -18,6 +19,10 @@ class AuditOutcome(str, enum.Enum):
     FAILURE = "failure"
     DENIED = "denied"
     PENDING_APPROVAL = "pending_approval"
+
+
+AUDIT_LOG_PATH_ENV = "MCP_TOOL_HARNESS_AUDIT_LOG_PATH"
+DEFAULT_AUDIT_LOG_PATH = Path("logs/tool-audit.jsonl")
 
 
 def _json_safe(value: Any) -> Any:
@@ -112,6 +117,49 @@ class JsonLinesAuditSink:
             handle.write(line)
 
 
+class JsonLinesAuditLogger:
+    """Direct JSON Lines audit logger used as the Gateway default sink.
+
+    Thread-safety说明：
+    - 每个 logger 实例通过 `JsonLinesAuditSink` 的 `asyncio.Lock` 串行化写入。
+    - 不在 Gateway 主链路加全局锁；高 QPS 生产场景应注入企业日志或审计后端。
+    """
+
+    def __init__(self, path: str | Path | None = None) -> None:
+        self.sink = JsonLinesAuditSink(default_audit_log_path() if path is None else path)
+
+    @property
+    def path(self) -> Path:
+        return self.sink.path
+
+    async def log(
+        self,
+        event_type: str,
+        *,
+        actor: str,
+        action: str,
+        resource: str,
+        outcome: AuditOutcome | str,
+        correlation_id: str | None = None,
+        request_id: str | None = None,
+        risk_level: str | None = None,
+        metadata: Mapping[str, Any] | None = None,
+    ) -> bool:
+        event = AuditEvent(
+            event_type=event_type,
+            actor=actor,
+            action=action,
+            resource=resource,
+            outcome=outcome,
+            correlation_id=correlation_id,
+            request_id=request_id,
+            risk_level=risk_level,
+            metadata=metadata or {},
+        )
+        await self.sink.write(event)
+        return True
+
+
 class AsyncAuditLogger:
     def __init__(
         self,
@@ -202,6 +250,17 @@ _default_sink = InMemoryAuditSink()
 _default_logger = AsyncAuditLogger(sinks=[_default_sink])
 
 
+def default_audit_log_path() -> Path:
+    configured = os.environ.get(AUDIT_LOG_PATH_ENV)
+    if configured:
+        return Path(configured).expanduser()
+    return DEFAULT_AUDIT_LOG_PATH
+
+
+def create_default_audit_logger(path: str | Path | None = None) -> JsonLinesAuditLogger:
+    return JsonLinesAuditLogger(path)
+
+
 def get_audit_logger() -> AsyncAuditLogger:
     return _default_logger
 
@@ -212,11 +271,16 @@ def get_memory_audit_sink() -> InMemoryAuditSink:
 
 __all__ = [
     "AsyncAuditLogger",
+    "AUDIT_LOG_PATH_ENV",
     "AuditEvent",
     "AuditOutcome",
     "AuditSink",
+    "DEFAULT_AUDIT_LOG_PATH",
     "InMemoryAuditSink",
+    "JsonLinesAuditLogger",
     "JsonLinesAuditSink",
+    "create_default_audit_logger",
+    "default_audit_log_path",
     "get_audit_logger",
     "get_memory_audit_sink",
 ]

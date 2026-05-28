@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import asyncio
+import fnmatch
 import inspect
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import replace
 from typing import Any
 
+from .audit import create_default_audit_logger
 from .models import (
     DecisionEffect,
     PolicyDecision,
@@ -17,6 +19,7 @@ from .models import (
     stable_json_hash,
 )
 from .registry import ToolNotFoundError as RegistryToolNotFoundError
+from mcp_tool_harness.observability.metrics import create_default_metrics_recorder
 
 
 class ToolGatewayError(Exception):
@@ -61,12 +64,12 @@ class ToolGateway:
         self.registry = registry
         self.security = security
         self.mcp_client = mcp_client
-        self.audit = audit
+        self.audit = audit if audit is not None else create_default_audit_logger()
         self.approval_center = approval_center
         self.limiter = limiter
         self.circuit_breaker = circuit_breaker
         self.idempotency_store = idempotency_store
-        self.metrics = metrics
+        self.metrics = metrics if metrics is not None else create_default_metrics_recorder()
         self.tracer = tracer
         self.default_timeout_ms = default_timeout_ms
 
@@ -91,8 +94,10 @@ class ToolGateway:
         idempotency_started = False
         audit_result: ToolResult | None = None
         audit_decision = PolicyDecision.allowed("policy not evaluated")
+        audit_enabled = True
 
         try:
+            audit_enabled = await self._resolve_audit_enabled_best_effort(context, tool)
             # 主链路第一步只做本地 schema 校验，失败时不触发 MCP/RPC 下游，避免无效流量打到业务系统。
             self._validate_input_schema(getattr(tool, "input_schema", None), normalized_args)
 
@@ -211,16 +216,17 @@ class ToolGateway:
             # 指标和审计不能影响主调用结果；内部会吞掉埋点异常，保障工具调用路径稳定。
             latency_ms = int((asyncio.get_running_loop().time() - started) * 1000)
             await self._record_metrics(resolved_tool_name, status, latency_ms)
-            await self._write_audit(
-                context,
-                tool,
-                normalized_args,
-                status,
-                error_code,
-                latency_ms,
-                result=audit_result,
-                decision=audit_decision,
-            )
+            if audit_enabled:
+                await self._write_audit(
+                    context,
+                    tool,
+                    normalized_args,
+                    status,
+                    error_code,
+                    latency_ms,
+                    result=audit_result,
+                    decision=audit_decision,
+                )
 
     async def _get_tool(self, tool_name: str, version: str | None) -> Any:
         # 优先按 server/name/version 查，支持多 MCP Server 下相同 tool_name 的隔离。
@@ -314,6 +320,75 @@ class ToolGateway:
         if decision == "approval_required":
             return PolicyDecision.require_approval("approval required")
         return PolicyDecision.denied("permission denied")
+
+    async def _resolve_audit_enabled_best_effort(self, context: ToolCallContext, tool: Any) -> bool:
+        try:
+            return await self._resolve_audit_enabled(context, tool)
+        except Exception:
+            return True
+
+    async def _resolve_audit_enabled(self, context: ToolCallContext, tool: Any) -> bool:
+        policy = None
+        if self.security is None:
+            policy = await self._resolve_registry_policy_for_audit(context, tool)
+        else:
+            resolver = getattr(self.security, "resolve_policy", None)
+            if resolver is not None:
+                policy = await self._call_policy_resolver(resolver, context, tool)
+            if policy is None:
+                policy = await self._resolve_registry_policy_for_audit(context, tool)
+        if policy is None:
+            return True
+        value = self._read_mapping_or_attr(policy, "audit_enabled", True)
+        return bool(value)
+
+    async def _resolve_registry_policy_for_audit(self, context: ToolCallContext, tool: Any) -> Any:
+        lister = getattr(self.registry, "list_policies", None)
+        if lister is None:
+            return None
+        tool_name = self._tool_name(tool)
+        server_id = getattr(tool, "server_id", context.server_id)
+        try:
+            policies = lister(server_id=server_id, tool_name=tool_name, enabled=True)
+        except TypeError:
+            try:
+                policies = lister(server_id=server_id, tool_name=tool_name)
+            except TypeError:
+                policies = lister()
+        resolved = await self._maybe_await(policies)
+        candidates: list[tuple[int, int, Any]] = []
+        for index, policy in enumerate(resolved or ()):
+            if self._read_mapping_or_attr(policy, "enabled", True) is not True:
+                continue
+            score = self._audit_policy_specificity(policy, server_id, tool_name)
+            if score is not None:
+                candidates.append((score, index, policy))
+        if not candidates:
+            return None
+        return max(candidates, key=lambda item: (item[0], item[1]))[2]
+
+    async def _call_policy_resolver(
+        self,
+        resolver: Callable[..., Any],
+        context: ToolCallContext,
+        tool: Any,
+    ) -> Any:
+        try:
+            parameters = inspect.signature(resolver).parameters
+        except (TypeError, ValueError):
+            return await self._maybe_await(resolver(context, tool))
+        if any(parameter.kind is inspect.Parameter.VAR_POSITIONAL for parameter in parameters.values()):
+            return await self._maybe_await(resolver(context, tool))
+        kwargs: dict[str, Any] = {}
+        if "context" in parameters:
+            kwargs["context"] = context
+        if "tool" in parameters:
+            kwargs["tool"] = tool
+        if kwargs:
+            return await self._maybe_await(resolver(**kwargs))
+        if len(parameters) >= 2:
+            return await self._maybe_await(resolver(context, tool))
+        return await self._maybe_await(resolver(tool))
 
     async def _request_approval(
         self,
@@ -471,19 +546,36 @@ class ToolGateway:
 
             logger = getattr(self.audit, "log", None)
             if logger is not None:
+                server_id = getattr(tool, "server_id", context.server_id or "local")
+                tool_name = self._tool_name(tool)
                 metadata = {
+                    "schema_version": "tool_call_audit.v1",
                     "arguments": dict(args),
                     "status": status.value,
                     "error_code": error_code,
                     "latency_ms": latency_ms,
+                    "request_id": context.request_id,
+                    "trace_id": context.trace_id,
+                    "principal": context.principal,
+                    "tenant_id": context.tenant_id,
+                    "server_id": server_id,
+                    "tool_name": tool_name,
+                    "tool_id": getattr(tool, "tool_id", None),
+                    "policy_id": getattr(decision, "policy_id", None),
+                    "decision_id": getattr(decision, "decision_id", None),
+                    "decision_effect": getattr(getattr(decision, "effect", None), "value", None),
+                    "decision_reason": getattr(decision, "reason", None),
+                    "audit_enabled": True,
+                    "result_success": getattr(result, "success", None),
+                    "result_status": getattr(getattr(result, "status", None), "value", None),
+                    "context_metadata": dict(context.metadata),
                 }
-                metadata.update(context.metadata)
                 await self._maybe_await(
                     logger(
                         "tool_call",
                         actor=context.principal,
-                        action=self._tool_name(tool),
-                        resource=f"{getattr(tool, 'server_id', 'local')}/{self._tool_name(tool)}",
+                        action=tool_name,
+                        resource=f"{server_id}/{tool_name}",
                         outcome="success" if status is ToolCallStatus.SUCCEEDED else "failure",
                         correlation_id=context.trace_id,
                         request_id=context.request_id,
@@ -742,6 +834,43 @@ class ToolGateway:
     @staticmethod
     def _tool_name(tool: Any) -> str:
         return str(getattr(tool, "tool_name", None) or getattr(tool, "name"))
+
+    @staticmethod
+    def _read_mapping_or_attr(value: Any, name: str, default: Any = None) -> Any:
+        if isinstance(value, Mapping):
+            return value.get(name, default)
+        return getattr(value, name, default)
+
+    @classmethod
+    def _audit_policy_specificity(
+        cls,
+        policy: Any,
+        server_id: str | None,
+        tool_name: str,
+    ) -> int | None:
+        policy_tool = str(cls._read_mapping_or_attr(policy, "tool_name", "*"))
+        policy_server = cls._read_mapping_or_attr(policy, "server_id", None)
+
+        tool_exact = policy_tool == tool_name
+        tool_wildcard = policy_tool == "*"
+        tool_pattern = not tool_exact and not tool_wildcard and fnmatch.fnmatchcase(tool_name, policy_tool)
+        if not (tool_exact or tool_wildcard or tool_pattern):
+            return None
+
+        server_specific = policy_server not in (None, "", "*")
+        server_exact = server_specific and server_id is not None and str(policy_server) == str(server_id)
+        if server_specific and not server_exact:
+            return None
+
+        if server_exact and tool_exact:
+            return 300
+        if not server_specific and tool_exact:
+            return 200
+        if server_exact and (tool_wildcard or tool_pattern):
+            return 100
+        if not server_specific and (tool_wildcard or tool_pattern):
+            return 0
+        return None
 
     async def _maybe_await(self, value: Any) -> Any:
         if inspect.isawaitable(value):
