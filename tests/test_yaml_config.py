@@ -3,6 +3,7 @@ from __future__ import annotations
 import pytest
 
 from mcp_tool_harness.config import (
+    ConfigLoadError,
     YamlConfigSource,
     apply_policy_config,
     create_mcp_client,
@@ -13,6 +14,77 @@ from mcp_tool_harness.core import PolicyAwareSecurity, Registry, ToolCallContext
 from mcp_tool_harness.core.gateway import ToolGateway
 from mcp_tool_harness.mcp import InMemoryTransport, MCPClient
 from mcp_tool_harness.runtime import PolicyAwareRateLimiter
+
+
+def test_load_yaml_config_without_global_policy_keeps_static_tool_policy_defaults() -> None:
+    empty_config = load_yaml_config(
+        """
+        tool_harness:
+          version: v1
+        """
+    )
+    assert empty_config.policies == ()
+
+    config = load_yaml_config(
+        """
+        tool_harness:
+          policies:
+            - tool_name: query.stats
+        """
+    )
+
+    policy = config.policies[0]
+    assert policy.tool_name == "query.stats"
+    assert policy.server_id is None
+    assert policy.allowed_agents == frozenset({"*"})
+    assert policy.timeout_ms is None
+    assert policy.circuit_failure_threshold == 5
+    assert policy.audit_enabled is True
+
+
+def test_load_yaml_config_normalizes_global_tool_policy() -> None:
+    config = load_yaml_config(
+        """
+        tool_harness:
+          version: global-v1
+          global_tool_policy:
+            risk_level: l1
+            allowed_agents: ["*"]
+            timeout_ms: 1500
+            rate_limits:
+              - dimension: tenant_tool
+                capacity: 100
+                refill_rate: 2
+          policies:
+            - mcp_service: payment-mcp
+              tool_name: "*"
+              risk_level: l2
+              allowed_agents: [finance-agent]
+              timeout_ms: 800
+        """
+    )
+
+    assert config.version == "global-v1"
+    assert len(config.policies) == 2
+    global_policy = config.policies[0]
+    assert global_policy.tool_name == "*"
+    assert global_policy.server_id is None
+    assert global_policy.risk_level.value == "l1"
+    assert global_policy.timeout_ms == 1500
+    assert global_policy.rate_limits[0]["dimension"] == "tenant_tool"
+    assert config.policies[1].server_id == "payment-mcp"
+
+
+def test_global_tool_policy_rejects_service_scope() -> None:
+    with pytest.raises(ConfigLoadError, match="server_id"):
+        load_yaml_config(
+            """
+            tool_harness:
+              global_tool_policy:
+                server_id: payment-mcp
+                timeout_ms: 1000
+            """
+        )
 
 
 def test_load_yaml_config_normalizes_tool_policies() -> None:
@@ -168,6 +240,95 @@ async def test_yaml_config_applies_to_registry_and_gateway(tmp_path) -> None:
     await apply_policy_config(registry, await source.load())
 
     assert (await invoke("yaml-4", "other-agent", "C-2")).success is True
+
+
+@pytest.mark.asyncio
+async def test_yaml_global_tool_policy_has_lower_priority_than_service_and_tool() -> None:
+    config = load_yaml_config(
+        """
+        tool_harness:
+          global_tool_policy:
+            allowed_agents: [global-agent]
+            timeout_ms: 1000
+            metadata:
+              scope: global
+          policies:
+            - mcp_service: payment-mcp
+              tool_name: "*"
+              allowed_agents: [payment-agent]
+              timeout_ms: 800
+              metadata:
+                scope: service
+            - tool_name: catalog.search
+              allowed_agents: [catalog-agent]
+              timeout_ms: 700
+              metadata:
+                scope: tool
+            - server_id: payment-mcp
+              tool_name: payment.refund
+              allowed_agents: [refund-agent]
+              timeout_ms: 600
+              metadata:
+                scope: service_tool
+        """
+    )
+
+    registry = Registry(cache_ttl_seconds=0)
+    await registry.register_tool(ToolSpec(name="inventory.query", description="Query inventory"))
+    await registry.register_tool(ToolSpec(name="catalog.search", description="Search catalog"))
+    await registry.register_tool(
+        ToolSpec(name="payment.capture", description="Capture payment", server_id="payment-mcp")
+    )
+    await registry.register_tool(
+        ToolSpec(name="payment.refund", description="Refund payment", server_id="payment-mcp")
+    )
+    await apply_policy_config(registry, config)
+
+    security = PolicyAwareSecurity(registry)
+
+    async def resolved_scope(server_id: str, tool_name: str) -> str:
+        tool = await registry.get_tool_by_identity(server_id, tool_name)
+        policy = await security.resolve_policy(
+            ToolCallContext(
+                request_id=f"resolve-{server_id}-{tool_name}",
+                principal="agent",
+                tool_name=tool_name,
+                server_id=server_id,
+            ),
+            tool,
+        )
+        assert policy is not None
+        return str(policy.metadata["scope"])
+
+    assert await resolved_scope("local", "inventory.query") == "global"
+    assert await resolved_scope("local", "catalog.search") == "tool"
+    assert await resolved_scope("payment-mcp", "payment.capture") == "service"
+    assert await resolved_scope("payment-mcp", "payment.refund") == "service_tool"
+
+    payment_capture = await registry.get_tool_by_identity("payment-mcp", "payment.capture")
+    denied_by_service_policy = await security.check_permission(
+        ToolCallContext(
+            request_id="priority-denied",
+            principal="global-agent",
+            tool_name="payment.capture",
+            server_id="payment-mcp",
+        ),
+        payment_capture,
+        {},
+    )
+    assert denied_by_service_policy.effect.value == "deny"
+
+    allowed_by_service_policy = await security.check_permission(
+        ToolCallContext(
+            request_id="priority-allowed",
+            principal="payment-agent",
+            tool_name="payment.capture",
+            server_id="payment-mcp",
+        ),
+        payment_capture,
+        {},
+    )
+    assert allowed_by_service_policy.effect.value == "allow"
 
 
 @pytest.mark.asyncio

@@ -212,7 +212,7 @@ def load_yaml_config(text: str) -> HarnessConfig:
 
     data = _load_yaml_mapping(text)
     root = _select_root(data)
-    policies = tuple(_tool_policy_from_mapping(item, index) for index, item in enumerate(_policy_items(root)))
+    policies = tuple(_iter_tool_policies(root))
     mcp_servers = tuple(
         _mcp_server_from_mapping(item, index)
         for index, item in enumerate(_mcp_server_items(root))
@@ -388,6 +388,29 @@ def _policy_items(root: Mapping[str, Any]) -> Sequence[Any]:
     return policies
 
 
+def _iter_tool_policies(root: Mapping[str, Any]) -> tuple[ToolPolicy, ...]:
+    policies: list[ToolPolicy] = []
+    global_item = _global_tool_policy_item(root)
+    if global_item is not None:
+        policies.append(_global_tool_policy_from_mapping(global_item))
+    policies.extend(
+        _tool_policy_from_mapping(item, index, source="policies")
+        for index, item in enumerate(_policy_items(root))
+    )
+    return tuple(policies)
+
+
+def _global_tool_policy_item(root: Mapping[str, Any]) -> Any | None:
+    keys = ("global_tool_policy", "default_tool_policy", "tool_policy_defaults")
+    configured = [(key, root[key]) for key in keys if key in root and root[key] is not None]
+    if len(configured) > 1:
+        names = ", ".join(key for key, _item in configured)
+        raise ConfigLoadError(f"only one global tool policy key may be configured: {names}")
+    if not configured:
+        return None
+    return configured[0][1]
+
+
 def _mcp_server_items(root: Mapping[str, Any]) -> Sequence[Any]:
     servers = root.get("mcp_servers", ())
     if servers is None:
@@ -397,14 +420,12 @@ def _mcp_server_items(root: Mapping[str, Any]) -> Sequence[Any]:
     return servers
 
 
-def _tool_policy_from_mapping(item: Any, index: int) -> ToolPolicy:
+def _tool_policy_from_mapping(item: Any, index: int | None, *, source: str) -> ToolPolicy:
+    label = source if index is None else f"{source}[{index}]"
     if not isinstance(item, Mapping):
-        raise ConfigLoadError(f"policies[{index}] must be a mapping")
+        raise ConfigLoadError(f"{label} must be a mapping")
     data = dict(item)
-    if "tool" in data and "tool_name" not in data:
-        data["tool_name"] = data.pop("tool")
-    if "agents" in data and "allowed_agents" not in data:
-        data["allowed_agents"] = data.pop("agents")
+    _normalize_policy_aliases(data, label)
 
     for name in ("allowed_agents", "denied_agents", "allowed_principals", "denied_principals"):
         if name in data:
@@ -412,8 +433,41 @@ def _tool_policy_from_mapping(item: Any, index: int) -> ToolPolicy:
     if "rate_limits" in data:
         data["rate_limits"] = tuple(_coerce_rate_limit_rule(item) for item in _coerce_list(data["rate_limits"]))
     if "metadata" in data and not isinstance(data["metadata"], Mapping):
-        raise ConfigLoadError(f"policies[{index}].metadata must be a mapping")
+        raise ConfigLoadError(f"{label}.metadata must be a mapping")
     return ToolPolicy(**data)
+
+
+def _global_tool_policy_from_mapping(item: Any) -> ToolPolicy:
+    if not isinstance(item, Mapping):
+        raise ConfigLoadError("global_tool_policy must be a mapping")
+    data = dict(item)
+    _normalize_policy_aliases(data, "global_tool_policy")
+
+    tool_name = data.pop("tool_name", "*")
+    if str(tool_name).strip() != "*":
+        raise ConfigLoadError("global_tool_policy.tool_name must be '*' when configured")
+
+    server_id = data.pop("server_id", None)
+    if server_id not in (None, "", "*"):
+        raise ConfigLoadError("global_tool_policy.server_id must not target a single MCP service")
+
+    data["tool_name"] = "*"
+    return _tool_policy_from_mapping(data, None, source="global_tool_policy")
+
+
+def _normalize_policy_aliases(data: dict[str, Any], label: str) -> None:
+    if "tool" in data and "tool_name" not in data:
+        data["tool_name"] = data.pop("tool")
+    for alias in ("mcp_service", "mcp_server_id", "mcp_server"):
+        if alias not in data:
+            continue
+        value = data.pop(alias)
+        if "server_id" not in data:
+            data["server_id"] = value
+        elif value not in (None, "", data["server_id"]):
+            raise ConfigLoadError(f"{label}.{alias} conflicts with server_id")
+    if "agents" in data and "allowed_agents" not in data:
+        data["allowed_agents"] = data.pop("agents")
 
 
 def _mcp_server_from_mapping(item: Any, index: int) -> MCPServerConfig:

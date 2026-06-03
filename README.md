@@ -231,6 +231,15 @@ asyncio.run(main())
 ```yaml
 tool_harness:
   version: trade-policy-v1
+  global_tool_policy:
+    risk_level: l1
+    allowed_agents: ["*"]
+    timeout_ms: 500
+    rate_limits:
+      - dimension: tenant_tool
+        capacity: 2000
+        refill_rate: 40
+
   policies:
     - server_id: trade-mcp
       tool_name: coupon.reserve
@@ -258,6 +267,13 @@ tool_harness:
           capacity: 1
           refill_rate: 0.01
 ```
+
+`global_tool_policy` 会被归一化为 `tool_name: "*"`、无 `server_id` 的
+全局 ToolPolicy。未配置该项时，仍使用 `ToolPolicy` 代码里的静态默认值；
+不会自动生成额外的全局策略。策略不是字段级继承，而是按最具体的一条命中：
+`server_id + tool_name` > `tool_name` > `server_id + "*"` > `global_tool_policy`。
+如果更习惯 MCP 服务语义，`policies` 中也可以用 `mcp_service` 作为
+`server_id` 的别名。
 
 加载并应用：
 
