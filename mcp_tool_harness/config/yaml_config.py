@@ -57,7 +57,9 @@ class MCPServerConfig:
     env: Mapping[str, str] = field(default_factory=dict)
     headers: Mapping[str, str] = field(default_factory=dict)
     timeout_ms: int | None = None
-    auto_initialize: bool = False
+    # 主流 MCP 服务器要求先 initialize 才能 tools/list；默认自动（惰性）握手，
+    # 显式配置 auto_initialize: false 可关闭。
+    auto_initialize: bool = True
     auth_type: AuthType = AuthType.NONE
     capabilities: tuple[str, ...] = field(default_factory=tuple)
     metadata: Mapping[str, Any] = field(default_factory=dict)

@@ -55,21 +55,39 @@ def normalize_tools(tools: Iterable[Mapping[str, Any]]) -> List[ToolSpec]:
     return [normalize_tool(tool) for tool in tools]
 
 
-def discover_tools(client: Any, *, cursor: Optional[str] = None) -> List[ToolSpec]:
-    """Discover tools through an MCPClient-like object."""
+_MAX_TOOLS_PAGES = 50
 
-    response = client.list_tools(cursor=cursor)
-    if isinstance(response, Mapping):
-        tools = response.get("tools", [])
-    else:
-        tools = response
-    if not isinstance(tools, Iterable):
-        raise ValueError("MCP tools/list response must contain an iterable tools field")
+
+def discover_tools(client: Any, *, cursor: Optional[str] = None) -> List[ToolSpec]:
+    """Discover tools through an MCPClient-like object.
+
+    Follows ``nextCursor`` pagination (bounded to ``_MAX_TOOLS_PAGES`` pages to
+    guard against malformed servers) and deduplicates tools by name.
+    """
+
     normalized: List[ToolSpec] = []
-    for tool in tools:
-        if not isinstance(tool, Mapping):
-            raise ValueError("MCP tools/list contains a non-object tool entry")
-        normalized.append(normalize_tool(tool))
+    seen: set[str] = set()
+    current_cursor = cursor
+    for _ in range(_MAX_TOOLS_PAGES):
+        response = client.list_tools(cursor=current_cursor)
+        if isinstance(response, Mapping):
+            tools = response.get("tools", [])
+            next_cursor = response.get("nextCursor")
+        else:
+            tools = response
+            next_cursor = None
+        if not isinstance(tools, Iterable):
+            raise ValueError("MCP tools/list response must contain an iterable tools field")
+        for tool in tools:
+            if not isinstance(tool, Mapping):
+                raise ValueError("MCP tools/list contains a non-object tool entry")
+            spec = normalize_tool(tool)
+            if spec.name not in seen:
+                seen.add(spec.name)
+                normalized.append(spec)
+        if not next_cursor:
+            break
+        current_cursor = next_cursor
     return normalized
 
 
