@@ -7,7 +7,7 @@ name = "mcp-tool-harness"
 dynamic = ["version"]
 description = "Enterprise Agent tool governance gateway — registry, policy, approval, rate limiting, circuit breaking, idempotency, audit, and observability"
 readme = "README.md"
-license = {text = "MIT"}
+license = "MIT"
 requires-python = ">=3.11"
 dependencies = []
 authors = [
@@ -17,7 +17,6 @@ keywords = ["mcp", "agent", "tool", "gateway", "governance", "llm", "ai-agent"]
 classifiers = [
     "Development Status :: 3 - Alpha",
     "Intended Audience :: Developers",
-    "License :: OSI Approved :: MIT License",
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
