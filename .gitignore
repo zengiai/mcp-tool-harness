@@ -20,3 +20,5 @@ dist/
 
 AGENTS.md
 output/
+_build_tools/
+dist/
