@@ -4,13 +4,38 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "mcp-tool-harness"
-version = "0.1.0"
-description = "Pure standard-library MCP tool harness core models and registry."
+dynamic = ["version"]
+description = "Enterprise Agent tool governance gateway — registry, policy, approval, rate limiting, circuit breaking, idempotency, audit, and observability"
+readme = "README.md"
+license = {text = "MIT"}
 requires-python = ">=3.11"
 dependencies = []
+authors = [
+    {name = "zengiai", email = "280326572@qq.com"}
+]
+keywords = ["mcp", "agent", "tool", "gateway", "governance", "llm", "ai-agent"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Software Development :: Libraries :: Application Frameworks",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+
+[project.urls]
+Homepage = "https://github.com/zengiai/mcp-tool-harness"
+Repository = "https://github.com/zengiai/mcp-tool-harness.git"
+Issues = "https://github.com/zengiai/mcp-tool-harness/issues"
 
 [tool.setuptools.packages.find]
 include = ["mcp_tool_harness*"]
 
 [tool.setuptools.package-data]
 "mcp_tool_harness.server" = ["console/*.html", "console/*.css", "console/*.js"]
+
+[tool.setuptools.dynamic]
+version = {attr = "mcp_tool_harness.__version__"}
