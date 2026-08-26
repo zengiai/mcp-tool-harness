@@ -1,0 +1,5 @@
+include README.md
+include LICENSE
+include CHANGELOG.md
+include pyproject.toml
+graft mcp_tool_harness
