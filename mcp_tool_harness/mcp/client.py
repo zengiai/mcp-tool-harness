@@ -61,12 +61,32 @@ class Transport(Protocol):
     ) -> Any:
         """Send a JSON-RPC request and return the response result."""
 
+    def send_notification(self, method: str, params: Optional[Mapping[str, Any]] = None) -> None:
+        """Send a JSON-RPC notification without waiting for a response.
+
+        Notifications carry no ``id`` and the server does not reply.  Transports
+        that cannot express out-of-band notifications (for example a strict
+        request/response channel) should record the call or raise
+        MCPTransportError instead of silently dropping it.
+        """
+
 
 def _json_rpc_request(request_id: int, method: str, params: Optional[Mapping[str, Any]]) -> Dict[str, Any]:
     # MCP 工具调用基于 JSON-RPC 2.0；每次请求都带 id，用来匹配响应。
     payload: Dict[str, Any] = {
         "jsonrpc": "2.0",
         "id": request_id,
+        "method": method,
+    }
+    if params is not None:
+        payload["params"] = dict(params)
+    return payload
+
+
+def _json_rpc_notification(method: str, params: Optional[Mapping[str, Any]]) -> Dict[str, Any]:
+    # JSON-RPC 通知不带 id，服务器不应返回响应（如 MCP 的 notifications/initialized）。
+    payload: Dict[str, Any] = {
+        "jsonrpc": "2.0",
         "method": method,
     }
     if params is not None:
@@ -206,6 +226,23 @@ class StdioTransport:
                     # 只消费当前 request_id 对应的响应；无关输出会继续等待。
                     return _parse_json_rpc_response(message, request_id)
 
+    def send_notification(self, method: str, params: Optional[Mapping[str, Any]] = None) -> None:
+        self.start()
+        process = self._process
+        if process is None or process.stdin is None:
+            raise MCPTransportError("MCP stdio server is not running")
+        if process.poll() is not None:
+            raise MCPTransportError(self._format_process_exit())
+
+        payload = _json_rpc_notification(method, params)
+        with self._lock:
+            # 通知不带 id，写一行即返回；与请求共用同一把锁保持单连接顺序写。
+            try:
+                process.stdin.write(json.dumps(payload, separators=(",", ":")) + "\n")
+                process.stdin.flush()
+            except OSError as exc:
+                raise MCPTransportError(f"Failed to write MCP stdio notification: {exc}") from exc
+
     def _read_stdout(self) -> None:
         process = self._process
         if process is None or process.stdout is None:
@@ -253,12 +290,34 @@ class StreamableHTTPTransport:
         self.headers = dict(headers or {})
         self.default_timeout = default_timeout
         self._ids = count(1)
+        self._lock = threading.Lock()
+        self._session_id: Optional[str] = None
 
     def start(self) -> None:
         return None
 
     def close(self) -> None:
-        return None
+        with self._lock:
+            self._session_id = None
+
+    def _request_headers(self) -> Dict[str, str]:
+        headers: Dict[str, str] = {
+            "Accept": "application/json, text/event-stream",
+            "Content-Type": "application/json",
+            **self.headers,
+        }
+        with self._lock:
+            session_id = self._session_id
+        if session_id is not None:
+            # MCP streamable HTTP 会话延续：服务端签发的 session id 必须回传。
+            headers["Mcp-Session-Id"] = session_id
+        return headers
+
+    def _capture_session_id(self, response: Any) -> None:
+        new_session_id = response.headers.get("Mcp-Session-Id")
+        if new_session_id:
+            with self._lock:
+                self._session_id = new_session_id
 
     def request(
         self,
@@ -270,29 +329,37 @@ class StreamableHTTPTransport:
         request_id = next(self._ids)
         payload = _json_rpc_request(request_id, method, params)
         body = json.dumps(payload, separators=(",", ":")).encode("utf-8")
-        # Accept 同时声明 JSON 和 text/event-stream，兼容普通 JSON 响应和 MCP streamable HTTP 响应。
-        headers = {
-            "Accept": "application/json, text/event-stream",
-            "Content-Type": "application/json",
-            **self.headers,
-        }
-        request = urllib.request.Request(self.url, data=body, headers=headers, method="POST")
+        request = urllib.request.Request(self.url, data=body, headers=self._request_headers(), method="POST")
         try:
             with urllib.request.urlopen(request, timeout=self.default_timeout if timeout is None else timeout) as response:
                 raw = response.read().decode(response.headers.get_content_charset("utf-8"))
                 content_type = response.headers.get("Content-Type", "")
+                self._capture_session_id(response)
         except urllib.error.URLError as exc:
             raise MCPTransportError(f"HTTP MCP request failed: {exc}") from exc
 
         message = _decode_http_response(raw, content_type)
         return _parse_json_rpc_response(message, request_id)
 
+    def send_notification(self, method: str, params: Optional[Mapping[str, Any]] = None) -> None:
+        payload = _json_rpc_notification(method, params)
+        body = json.dumps(payload, separators=(",", ":")).encode("utf-8")
+        request = urllib.request.Request(self.url, data=body, headers=self._request_headers(), method="POST")
+        try:
+            # 通知不等待响应体：服务端通常以 202 Accepted 回应，urllib 对 2xx 正常返回。
+            with urllib.request.urlopen(request, timeout=self.default_timeout) as response:
+                self._capture_session_id(response)
+        except urllib.error.URLError as exc:
+            raise MCPTransportError(f"HTTP MCP notification failed: {exc}") from exc
+
 
 class SSETransport:
-    """SSE transport shape for MCP servers using a separate POST endpoint.
+    """SSE transport for MCP servers using a separate POST endpoint.
 
-    The transport accepts a known message endpoint.  Full SSE session discovery
-    can be layered above this class without changing MCPClient.
+    When ``message_endpoint`` is known it is used directly.  Otherwise the
+    transport performs standard SSE session discovery: it GETs ``sse_url`` and
+    waits for the server's ``endpoint`` event, then POSTs JSON-RPC messages to
+    the discovered URL (which may carry a session id in its query string).
     """
 
     def __init__(
@@ -310,11 +377,48 @@ class SSETransport:
         self._http: Optional[StreamableHTTPTransport] = None
 
     def start(self) -> None:
-        if self.message_endpoint is None:
+        if self._http is not None:
             return
-        # 第一版只支持已知 message endpoint；完整 SSE 会话发现可以在外层 discovery 中增强。
-        url = urllib.parse.urljoin(self.sse_url, self.message_endpoint)
+        if self.message_endpoint is not None:
+            # 显式配置的消息端点：直接使用，不做发现。
+            url = urllib.parse.urljoin(self.sse_url, self.message_endpoint)
+        else:
+            url = self._discover_endpoint()
         self._http = StreamableHTTPTransport(url, headers=self.headers, default_timeout=self.default_timeout)
+
+    def _discover_endpoint(self) -> str:
+        # 标准 SSE 会话发现：GET 流上服务端通过 endpoint 事件公布消息端点。
+        request = urllib.request.Request(self.sse_url, headers=self.headers, method="GET")
+        try:
+            response = urllib.request.urlopen(request, timeout=self.default_timeout)
+        except urllib.error.URLError as exc:
+            raise MCPTransportError(f"Failed to open MCP SSE stream {self.sse_url}: {exc}") from exc
+        try:
+            event: Dict[str, List[str]] = {}
+            for raw_line in response:
+                line = raw_line.decode("utf-8").rstrip("\r\n")
+                if not line:
+                    if event:
+                        fields = {key: "\n".join(value) for key, value in event.items()}
+                        if fields.get("event") == "endpoint" and fields.get("data"):
+                            return urllib.parse.urljoin(self.sse_url, fields["data"])
+                        event = {}
+                    continue
+                if line.startswith(":"):
+                    continue
+                field, _, value = line.partition(":")
+                event.setdefault(field, []).append(value.lstrip())
+            if event:
+                fields = {key: "\n".join(value) for key, value in event.items()}
+                if fields.get("event") == "endpoint" and fields.get("data"):
+                    return urllib.parse.urljoin(self.sse_url, fields["data"])
+        except (OSError, TimeoutError) as exc:
+            raise MCPTransportError(
+                f"Failed while discovering MCP SSE endpoint from {self.sse_url}: {exc}"
+            ) from exc
+        finally:
+            response.close()
+        raise MCPTransportError(f"MCP SSE stream from {self.sse_url} did not provide an endpoint event")
 
     def close(self) -> None:
         if self._http is not None:
@@ -335,6 +439,16 @@ class SSETransport:
                 "provide a discovered MCP messages endpoint or a custom Transport."
             )
         return self._http.request(method, params, timeout=timeout)
+
+    def send_notification(self, method: str, params: Optional[Mapping[str, Any]] = None) -> None:
+        if self._http is None:
+            self.start()
+        if self._http is None:
+            raise MCPTransportError(
+                "SSETransport requires message_endpoint to send notifications; "
+                "provide a discovered MCP messages endpoint or a custom Transport."
+            )
+        self._http.send_notification(method, params)
 
 
 def _decode_http_response(raw: str, content_type: str) -> Mapping[str, Any]:
@@ -464,6 +578,12 @@ class InMemoryTransport:
             return self._call_tool(payload)
         raise MCPProtocolError(f"No in-memory handler registered for MCP method {method}")
 
+    def send_notification(self, method: str, params: Optional[Mapping[str, Any]] = None) -> None:
+        # 通知记录到 requests 便于断言，不返回响应。
+        self.start()
+        payload = dict(params or {})
+        self.requests.append({"method": method, "params": payload})
+
     def _call_tool(self, params: Mapping[str, Any]) -> Any:
         name = params.get("name")
         if not isinstance(name, str) or not name:
@@ -519,8 +639,10 @@ class MCPClient:
         self.server_info: Dict[str, Any] = {}
         self.server_capabilities: Dict[str, Any] = {}
         self.initialized = False
-        if auto_initialize:
-            self.initialize()
+        # auto_initialize 采用惰性语义：首个非 initialize 请求前自动握手，
+        # 避免构造阶段发起网络调用，同时保证 MCP 规范要求的"先握手再请求"。
+        self.auto_initialize = auto_initialize
+        self._init_lock = threading.Lock()
 
     @classmethod
     def from_stdio(cls, command: Sequence[str], **kwargs: Any) -> "MCPClient":
@@ -571,6 +693,9 @@ class MCPClient:
         self.initialized = True
         self.server_info = dict(result.get("serverInfo") or {})
         self.server_capabilities = dict(result.get("capabilities") or {})
+        # MCP 规范要求客户端在收到 initialize 响应后发送 notifications/initialized；
+        # 部分严格服务器在收到该通知前拒绝其他请求。
+        self.transport.send_notification("notifications/initialized")
         return result
 
     def request(
@@ -581,6 +706,11 @@ class MCPClient:
         timeout: Optional[float] = None,
     ) -> Any:
         # 统一出口：上层 list_tools/call_tool 都会落到 transport.request。
+        # 惰性握手：首个非 initialize 请求前自动完成 initialize（线程安全，仅执行一次）。
+        if method != "initialize" and self.auto_initialize and not self.initialized:
+            with self._init_lock:
+                if not self.initialized:
+                    self.initialize(timeout=timeout)
         return self.transport.request(method, params, timeout=timeout)
 
     def ping(self, *, timeout: Optional[float] = None) -> Any:

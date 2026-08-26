@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Any, Callable, Mapping
 
 from mcp_tool_harness.core.audit import default_audit_log_path
+from mcp_tool_harness.mcp import DEFAULT_PROTOCOL_VERSION
 from mcp_tool_harness.observability.metrics import (
     default_metrics_log_path,
     read_metrics_events,
@@ -345,9 +346,13 @@ def create_app(gateway: ToolGateway | None = None) -> Any:
                 detail=_error_payload(exc),
             ) from exc
 
-    @app.post("/mcp")
-    async def mcp_json_rpc(message: dict[str, Any]) -> dict[str, Any]:
-        return await _handle_json_rpc(app_gateway, message)
+    @app.post("/mcp", response_model=None)
+    async def mcp_json_rpc(message: dict[str, Any]) -> dict[str, Any] | Response:
+        result = await _handle_json_rpc(app_gateway, message)
+        if result is None:
+            # JSON-RPC 通知（如 notifications/initialized）：规范要求不返回响应体。
+            return Response(status_code=202)
+        return result
 
     @app.get("/console", response_class=HTMLResponse)
     async def console() -> Any:
@@ -592,12 +597,27 @@ def _read_console_asset(asset_name: str) -> str:
         raise RuntimeError(f"console asset is missing: {asset_name}") from exc
 
 
-async def _handle_json_rpc(gateway: ToolGateway, message: Mapping[str, Any]) -> dict[str, Any]:
+async def _handle_json_rpc(gateway: ToolGateway, message: Mapping[str, Any]) -> dict[str, Any] | None:
     request_id = message.get("id")
     method = message.get("method")
+    if "id" not in message:
+        # JSON-RPC 通知：不产生响应（例如 notifications/initialized）。
+        return None
     try:
+        if method == "initialize":
+            # MCP 握手：返回服务端支持的协议版本、能力与标识。
+            # 客户端请求的版本不在支持列表时仍返回本服务端版本，由客户端决定是否继续。
+            result = {
+                "protocolVersion": DEFAULT_PROTOCOL_VERSION,
+                "capabilities": {"tools": {}},
+                "serverInfo": {"name": "mcp-tool-harness", "version": "0.1.0"},
+            }
+            return {"jsonrpc": "2.0", "id": request_id, "result": result}
+        if method == "ping":
+            return {"jsonrpc": "2.0", "id": request_id, "result": {}}
         if method == "tools/list":
-            result = {"tools": gateway.list_tools()}
+            # 内部注册表是 snake_case；对外按 MCP 规范输出 camelCase（inputSchema 必填）。
+            result = {"tools": [_mcp_tool_payload(item) for item in gateway.list_tools()]}
         elif method == "tools/call":
             params = dict(message.get("params") or {})
             response = await gateway.ainvoke(
@@ -607,8 +627,11 @@ async def _handle_json_rpc(gateway: ToolGateway, message: Mapping[str, Any]) -> 
                 idempotency_key=params.get("idempotency_key") or params.get("idempotencyKey"),
                 request_id=str(request_id) if request_id is not None else None,
             )
+            # MCP 标准 content 块为 text/image/audio/resource；结构化结果走 structuredContent。
             result = {
-                "content": [{"type": "json", "json": response.result}],
+                "content": [
+                    {"type": "text", "text": json.dumps(response.result, ensure_ascii=False, default=str)}
+                ],
                 "structuredContent": response.result,
                 "cached": response.cached,
             }
@@ -617,7 +640,8 @@ async def _handle_json_rpc(gateway: ToolGateway, message: Mapping[str, Any]) -> 
     except KeyError as exc:
         return _json_rpc_error(request_id, -32602, f"missing required parameter: {exc}")
     except ToolHarnessError as exc:
-        return _json_rpc_error(request_id, exc.status_code, str(exc), data=_error_payload(exc))
+        # JSON-RPC 服务端错误区间为 -32000..-32099；原始 HTTP 状态码放入 data。
+        return _json_rpc_error(request_id, -32000, str(exc), data=_error_payload(exc))
 
     return {"jsonrpc": "2.0", "id": request_id, "result": result}
 
@@ -635,8 +659,24 @@ def _json_rpc_error(
     return {"jsonrpc": "2.0", "id": request_id, "error": error}
 
 
+def _mcp_tool_payload(item: Mapping[str, Any]) -> dict[str, Any]:
+    """Map a registry tool dict to the MCP tools/list schema (camelCase)."""
+
+    payload: dict[str, Any] = {
+        "name": item.get("name"),
+        "description": item.get("description") or "",
+        # MCP 规范要求 inputSchema 必填；缺省给一个空的 object schema。
+        "inputSchema": item.get("input_schema") or {"type": "object", "properties": {}},
+    }
+    if item.get("output_schema"):
+        payload["outputSchema"] = item["output_schema"]
+    if item.get("annotations"):
+        payload["annotations"] = item["annotations"]
+    return payload
+
+
 def _error_payload(exc: ToolHarnessError) -> dict[str, Any]:
-    payload = {"code": exc.error_code, "message": str(exc)}
+    payload = {"status_code": exc.status_code, "code": exc.error_code, "message": str(exc)}
     if isinstance(exc, ApprovalRequiredError):
         payload["approval_id"] = exc.approval_id
     return payload
