@@ -58,6 +58,77 @@ async def test_core_gateway_invokes_registered_mcp_tool() -> None:
 
 
 @pytest.mark.asyncio
+async def test_core_gateway_preserves_business_payload_with_top_level_data_field() -> None:
+    # Shopify GraphQL MCP server 直接把 GraphQL 响应作为 tools/call 的 result 返回：
+    # {"data": {...}, "extensions": {...}}。网关不应把业务顶层 data 误当成 MCP 信封。
+    class GraphQLMCPClient:
+        async def call_tool(self, _name: str, _arguments: dict[str, Any]) -> dict[str, Any]:
+            return {
+                "data": {"shop": {"name": "Acme"}},
+                "extensions": {"cost": {"requestedQueryCost": 3}},
+            }
+
+    registry = Registry()
+    await registry.register_tool(
+        ToolSpec(
+            name="shopify.graphql",
+            description="Run a Shopify GraphQL query",
+            input_schema={"type": "object", "properties": {}},
+        )
+    )
+    gateway = ToolGateway(
+        registry=registry,
+        security=None,
+        mcp_client=GraphQLMCPClient(),
+    )
+    context = ToolCallContext(
+        request_id="gql-1",
+        principal="agent-a",
+        tool_name="shopify.graphql",
+    )
+
+    result = await gateway.invoke("shopify.graphql", {}, context)
+
+    assert result.success is True
+    assert result.output == {
+        "data": {"shop": {"name": "Acme"}},
+        "extensions": {"cost": {"requestedQueryCost": 3}},
+    }
+
+
+@pytest.mark.asyncio
+async def test_core_gateway_unwraps_mcp_structured_content_envelope() -> None:
+    # MCP 标准结构化信封应只解包 structuredContent，不返回 content/isError 外壳。
+    class StructuredMCPClient:
+        async def call_tool(self, _name: str, _arguments: dict[str, Any]) -> dict[str, Any]:
+            return {
+                "content": [{"type": "text", "text": "ok"}],
+                "structuredContent": {"sku": "SKU-1"},
+                "isError": False,
+            }
+
+    registry = Registry()
+    await registry.register_tool(
+        ToolSpec(
+            name="order.create",
+            description="Create order",
+            input_schema={"type": "object", "properties": {}},
+        )
+    )
+    gateway = ToolGateway(
+        registry=registry,
+        security=None,
+        mcp_client=StructuredMCPClient(),
+    )
+    context = ToolCallContext(request_id="env-1", principal="agent-a", tool_name="order.create")
+
+    result = await gateway.invoke("order.create", {}, context)
+
+    assert result.success is True
+    assert result.output == {"sku": "SKU-1"}
+
+
+@pytest.mark.asyncio
 async def test_core_gateway_rejects_invalid_arguments_before_mcp_call() -> None:
     registry = Registry()
     await registry.register_tool(

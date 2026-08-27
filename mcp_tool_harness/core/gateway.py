@@ -442,12 +442,15 @@ class ToolGateway:
         if isinstance(raw, ToolResult):
             return raw
         if isinstance(raw, Mapping):
-            # MCP 标准结果通常是 content/structuredContent/isError，这里归一成内部 ToolResult。
+            # 只有携带 MCP CallToolResult 协议标志（content/structuredContent/isError）
+            # 的 mapping 才按信封解包。structuredContent 是唯一明确的结构化解包标志；
+            # data/result 是常见业务字段名（如 Shopify GraphQL 顶层就有 data），
+            # 不能猜测，否则会吞掉 extensions 等兄弟字段。无信封标志时整包透传。
             success = bool(raw.get("success", not raw.get("isError", False)))
             if success:
                 data = raw.get("structuredContent")
                 if data is None:
-                    data = raw.get("data", raw.get("result", raw))
+                    data = raw
                 return ToolResult.success_result(
                     call_id=context.call_id,
                     trace_id=context.trace_id,

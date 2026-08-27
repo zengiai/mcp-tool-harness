@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.1] - 2026-08-27
+
+### Fixed
+- Preserve complete non-envelope MCP business payloads, including top-level `data` and `extensions` fields.
+
 ### Added
 - Open-source release standardization: `__version__`, CHANGELOG, LICENSE, MANIFEST.in, CI/CD workflows, Makefile
 
